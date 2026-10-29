@@ -1,0 +1,283 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -1,7 +1,7 @@
+ /*
+  * SM8735 SMP bring-up for Metroid using XNU's legacy IOCPU interface and PSCI.
+  * The architected timer and SGI1 already enter through pe_fiq/sleh_irq.
+- * CPU_OFF, suspend and frequency control still require separate platform work.
++ * CPU_OFF and suspend still require separate platform work.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -16,10 +16,126 @@
+ #include <kern/processor.h>
+ #include <kern/thread.h>
+ #include <mach/mach_time.h>
++#include <mach/machine.h>
+ #include <pexpert/pexpert.h>
+ 
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
++
++/* EPSS MMIO is mapped once, on the startup thread after all CPUs are online. */
++extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* Internal OSFMK accounting interfaces are not exported to IOKit headers. */
++extern "C" processor_t processor_array[];
++extern "C" void processor_cpu_load_info(processor_t, natural_t *);
++#define EPSS_READ(base, off) (*(volatile uint32_t *)((base) + (off)))
++#define EPSS_WRITE(base, off, value) (*(volatile uint32_t *)((base) + (off)) = (value))
++#define EPSS_BARRIER() __builtin_arm_dsb(DSB_SY)
++#include "MetroidEPSS.h"
++#undef EPSS_READ
++#undef EPSS_WRITE
++#undef EPSS_BARRIER
++
++static uint32_t metroid_capacities[MAX_CPUS];
++extern "C" uint32_t
++metroid_cpu_capacity(unsigned int cpu)
++{
++    return cpu < MAX_CPUS ? __atomic_load_n(&metroid_capacities[cpu], __ATOMIC_RELAXED) : 0;
++}
++
++static void
++metroid_dvfs_thread(void *, wait_result_t)
++{
++    const ml_topology_info_t *topology = ml_get_topology_info();
++    metroid_epss domains[4] = {};
++    uint32_t positions[4] = {}, cpu_domains[MAX_CPUS] = {};
++    natural_t previous[MAX_CPUS][CPU_STATE_MAX] = {};
++    bool sampled[MAX_CPUS] = {};
++    unsigned active = 0;
++    for (unsigned i = 0; i < topology->num_cpus; i++) {
++        unsigned physical = topology->cpus[i].phys_id >> 8;
++        if (physical >= 8) panic("METROID DVFS: invalid CPU affinity");
++        cpu_domains[i] = metroid_cpu_domain[physical];
++        active |= 1u << cpu_domains[i];
++    }
++    for (unsigned i = 0; i < 4; i++) {
++        if (!(active & (1u << i))) continue;
++        domains[i].cores = metroid_domain_cores[i];
++        domains[i].base = ml_io_map(0x17d91000ULL + i * 0x1000, 0x1000);
++        if (!domains[i].base || !metroid_epss_probe(&domains[i])) {
++            IOLog("METROID DVFS: domain %u disabled/invalid firmware LUT; votes untouched\n", i);
++            continue;
++        }
++        /* Start from the inherited vote; no frequency request during probe. */
++        uint32_t inherited = *(volatile uint32_t *)(domains[i].base + 0x320);
++        while (positions[i] + 1 < domains[i].count &&
++            domains[i].row[positions[i]] < inherited) positions[i]++;
++        IOLog("METROID DVFS: domain %u %u non-boost XO rows %u..%u kHz, %s votes\n",
++            i, domains[i].count, domains[i].khz[0], domains[i].khz[domains[i].count - 1],
++            domains[i].per_core ? "per-core" : "shared");
++    }
++    unsigned governed = 0;
++    for (unsigned i = 0; i < 4; i++) governed += domains[i].enabled ? 1 : 0;
++    if (!governed) {
++        IOLog("METROID DVFS: no enabled domains; governor stopped\n");
++        thread_terminate(current_thread());
++    }
++    for (unsigned i = 0; i < topology->num_cpus; i++) {
++        metroid_epss *d = &domains[cpu_domains[i]];
++        if (!d->enabled) continue;
++        unsigned physical = topology->cpus[i].phys_id >> 8;
++        /* Reference capacity-dmips-mhz: A720=1024, X4=1157. */
++        uint32_t capacity = (uint32_t)((uint64_t)d->khz[d->count - 1] *
++            (physical == 7 ? 1157 : 1024) / 1024);
++        __atomic_store_n(&metroid_capacities[i], capacity, __ATOMIC_RELAXED);
++    }
++    for (;;) {
++        IOSleep(200);
++        uint32_t load[4] = {};
++        bool valid[4] = {}, complete[4] = {true, true, true, true};
++        for (unsigned i = 0; i < topology->num_cpus; i++) {
++            unsigned domain = cpu_domains[i];
++            processor_t cpu = processor_array[i];
++            if (cpu == PROCESSOR_NULL) { complete[domain] = false; continue; }
++            natural_t ticks[CPU_STATE_MAX] = {};
++            processor_cpu_load_info(cpu, ticks);
++            uint64_t total = 0, idle = 0;
++            for (unsigned s = 0; s < CPU_STATE_MAX; s++) {
++                uint32_t delta = ticks[s] - previous[i][s];
++                total += delta;
++                if (s == CPU_STATE_IDLE) idle = delta;
++                previous[i][s] = ticks[s];
++            }
++            if (sampled[i] && total) {
++                uint32_t busy = (uint32_t)((total - idle) * 100 / total);
++                if (busy > load[domain]) load[domain] = busy;
++                valid[domain] = true;
++            } else complete[domain] = false;
++            sampled[i] = true;
++        }
++        for (unsigned i = 0; i < 4; i++) {
++            if (!domains[i].enabled || !valid[i] || !complete[i]) continue;
++            uint32_t next = metroid_epss_target(&domains[i], positions[i], load[i]);
++            if (next == positions[i]) continue;
++            if (!metroid_epss_vote(&domains[i], next)) {
++                IOLog("METROID DVFS: domain %u vote rejected; governor stopped\n", i);
++                continue;
++            }
++            positions[i] = next;
++        }
++    }
++}
++
++static void
++metroid_dvfs_start(void)
++{
++    int enable = 1;
++    PE_parse_boot_argn("metroid_dvfs", &enable, sizeof(enable));
++    if (!enable) { IOLog("METROID DVFS: disabled by boot argument\n"); return; }
++    thread_t thread;
++    kern_return_t kr = kernel_thread_start(metroid_dvfs_thread, NULL, &thread);
++    if (kr == KERN_SUCCESS) thread_deallocate(thread);
++    else IOLog("METROID DVFS: governor thread failed %d\n", kr);
++}
+ 
+ class SweetCPU;
+ static SweetCPU *sweet_cpus[MAX_CPUS];
+@@ -180,6 +296,7 @@
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);
+ 	IOLog("METROID CPU: %u/%u CPUs initialized, SGI1 verified\n",
+ 	    topology->num_cpus, topology->num_cpus);
++	metroid_dvfs_start();
+ 	thread_terminate(current_thread());
+ }
+ 
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -1973,9 +1973,25 @@
+ {
+ }
+ 
++/* Called with the pset locked. Prefer a higher-capacity idle core without
++ * taking busy/offline CPUs or changing affinity, realtime or bound-thread rules.
++ * Keep the existing hint on ties to avoid unnecessary cache migration. */
++extern uint32_t metroid_cpu_capacity(unsigned int cpu);
+ processor_t
+ machine_choose_processor(__unused processor_set_t pset, processor_t processor)
+ {
++	cpumap_t idle = pset->cpu_state_map[PROCESSOR_IDLE] &
++	    pset->cpu_available_map & pset->recommended_bitmask & pset->primary_map;
++	uint32_t best = processor != PROCESSOR_NULL ? metroid_cpu_capacity(processor->cpu_id) : 0;
++	for (unsigned int cpu = 0; cpu < MAX_CPUS; cpu++) {
++		if (!(idle & (1ULL << cpu))) continue;
++		processor_t candidate = processor_array[cpu];
++		uint32_t capacity = metroid_cpu_capacity(cpu);
++		if (candidate != PROCESSOR_NULL && candidate->processor_set == pset && capacity > best) {
++			processor = candidate;
++			best = capacity;
++		}
++	}
+ 	return processor;
+ }
+ 
+diff --git a/iokit/Kernel/arm/MetroidEPSS.h b/iokit/Kernel/arm/MetroidEPSS.h
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/MetroidEPSS.h
+@@ -0,0 +1,102 @@
++/* SPDX-License-Identifier: BSD-2-Clause
++ * Metroid EPSS protocol, independently implemented from the register contract in
++ * NothingOSS 031e8669 drivers/cpufreq/qcom-cpufreq-hw.c and tuna.dtsi.
++ * Firmware owns LUTs, voltage sequencing and LMh throttling. Never enable/reset
++ * EPSS or alter its voltage, interrupt, thermal or PLL registers here.
++ * RPMH_CXO_CLK = xo_board (76.8 MHz) / 2 / 2 = 19.2 MHz.
++ * Source-zero (alternate GPLL) rows are deliberately not requested: no GCC
++ * clock driver exists to establish that rate on this kernel.
++ */
++#ifndef METROID_EPSS_H
++#define METROID_EPSS_H
++#define METROID_EPSS_ROWS 40u
++#define METROID_EPSS_XO_KHZ 19200u
++struct metroid_epss {
++    uintptr_t base;
++    uint32_t khz[METROID_EPSS_ROWS];
++    uint32_t row[METROID_EPSS_ROWS];
++    uint32_t count, slots, cores, low_samples;
++    bool per_core, enabled;
++};
++/* The CPU affinity-to-domain mapping is from tuna.dtsi, not logical CPU order. */
++static const uint8_t metroid_cpu_domain[8] = {0, 0, 3, 3, 3, 1, 1, 2};
++static const uint8_t metroid_domain_cores[4] = {2, 2, 1, 3};
++
++static bool
++metroid_epss_probe(struct metroid_epss *d)
++{
++    d->enabled = false;
++    d->count = d->slots = d->low_samples = 0;
++    uint32_t enabled = EPSS_READ(d->base, 0), ctrl = EPSS_READ(d->base, 0xb0);
++    if (enabled == ~0u || ctrl == ~0u || !(enabled & 1) || !d->cores || d->cores > 3) return false;
++    d->per_core = (ctrl & 1) != 0;
++    uint32_t prev = ~0u, max_cores = 0;
++    for (uint32_t i = 0; i < METROID_EPSS_ROWS; i++) {
++        uint32_t raw = EPSS_READ(d->base, 0x100 + i * 4);
++        if (raw == ~0u) return false;
++        uint32_t voltage = EPSS_READ(d->base, 0x200 + i * 4) & 0xfff;
++        uint32_t src = raw >> 30, lval = raw & 0xff;
++        uint32_t cores = (raw >> 16) & 7;
++        uint32_t freq = src ? METROID_EPSS_XO_KHZ * lval : 0;
++        if (i == 0) max_cores = cores;
++        /* Linux terminates at the first repeated decoded frequency. */
++        if (i && freq == prev) break;
++        d->slots = i + 1;
++        if (src && (!lval || !voltage || freq > 6000000)) return false;
++        if (freq && cores >= max_cores) {
++            if (d->count && freq <= d->khz[d->count - 1]) return false;
++            d->row[d->count] = i;
++            d->khz[d->count++] = freq;
++        }
++        prev = freq;
++    }
++    if (!d->count) return false;
++    uint32_t n = d->per_core ? d->cores : 1;
++    for (uint32_t i = 0; i < n; i++)
++        if (EPSS_READ(d->base, 0x320 + 4 * i) >= d->slots) return false;
++    d->enabled = true;
++    return true;
++}
++
++/* Hysteresis: raise at >=75% busy; lower after five <=25% samples (1 s).
++ * One busy core raises its whole domain. Intermediate load holds the vote.
++ * Logical table positions retain the actual firmware row indices. */
++static uint32_t
++metroid_epss_target(struct metroid_epss *d, uint32_t position, uint32_t busy)
++{
++    if (busy >= 75) { d->low_samples = 0; return d->count - 1; }
++    if (busy <= 25) {
++        if (++d->low_samples >= 5) {
++            d->low_samples = 0;
++            return position ? position - 1 : 0;
++        }
++    } else d->low_samples = 0;
++    return position;
++}
++
++static bool
++metroid_epss_vote(struct metroid_epss *d, uint32_t position)
++{
++    if (!d->enabled || position >= d->count) return false;
++    if (!(EPSS_READ(d->base, 0) & 1)) { d->enabled = false; return false; }
++    uint32_t previous[3], n = d->per_core ? d->cores : 1;
++    for (uint32_t i = 0; i < n; i++) {
++        previous[i] = EPSS_READ(d->base, 0x320 + 4 * i);
++        if (previous[i] >= d->slots) { d->enabled = false; return false; }
++    }
++    for (uint32_t i = 0; i < n; i++)
++        EPSS_WRITE(d->base, 0x320 + 4 * i, d->row[position]);
++    EPSS_BARRIER();
++    for (uint32_t i = 0; i < n; i++) {
++        if (EPSS_READ(d->base, 0x320 + 4 * i) != d->row[position]) {
++            /* Restore inherited votes, then permanently stop this governor. */
++            for (uint32_t j = 0; j < n; j++)
++                EPSS_WRITE(d->base, 0x320 + 4 * j, previous[j]);
++            EPSS_BARRIER();
++            d->enabled = false;
++            return false;
++        }
++    }
++    return true;
++}
++#endif

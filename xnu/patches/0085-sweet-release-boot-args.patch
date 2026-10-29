@@ -1,0 +1,46 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -192,9 +192,11 @@
+ static TUNABLE(bool, bootarg_arm64e_preview_abi, "-arm64e_preview_abi", false);
+ #endif /* __has_feature(ptrauth_calls) */
+ 
+-#if DEBUG || DEVELOPMENT
++#if DEBUG || DEVELOPMENT || defined(ARM64_BOARD_CONFIG_SWEET)
++/* SWEET boots iOS userspace on the macOS configuration in RELEASE too.
++ * Preserve the explicit boot argument and its disabled default. */
+ static TUNABLE(bool, unentitled_ios_sim_launch, "unentitled_ios_sim_launch", false);
+-#endif /* DEBUG || DEVELOPMENT */
++#endif /* DEBUG || DEVELOPMENT || ARM64_BOARD_CONFIG_SWEET */
+ #endif /* XNU_TARGET_OS_OSX */
+ 
+ #if CONFIG_DTRACE
+@@ -7392,7 +7394,7 @@
+ 		struct _posix_spawnattr *psa = (struct _posix_spawnattr *) imgp->ip_px_sa;
+ 		if (psa == NULL || psa->psa_platform == 0) {
+ 			boolean_t no_sandbox_entitled = FALSE;
+-#if DEBUG || DEVELOPMENT
++#if DEBUG || DEVELOPMENT || defined(ARM64_BOARD_CONFIG_SWEET)
+ 			/*
+ 			 * Allow iOS binaries to spawn on internal systems
+ 			 * if no-sandbox entitlement is present of unentitled_ios_sim_launch
+@@ -7404,7 +7406,7 @@
+ 				no_sandbox_entitled = IOVnodeHasEntitlement(imgp->ip_vp,
+ 				    (int64_t)imgp->ip_arch_offset, "com.apple.private.security.no-sandbox");
+ 			}
+-#endif /* DEBUG || DEVELOPMENT */
++#endif /* DEBUG || DEVELOPMENT || ARM64_BOARD_CONFIG_SWEET */
+ 			if (!no_sandbox_entitled) {
+ 				signature_failure_reason = os_reason_create(OS_REASON_EXEC,
+ 				    EXEC_EXIT_REASON_WRONG_PLATFORM);
+--- a/pexpert/arm/pe_kprintf.c
++++ b/pexpert/arm/pe_kprintf.c
+@@ -46,7 +46,8 @@
+ 
+ #if DEBUG
+ 	disable_kprintf_output = false;
+-#elif DEVELOPMENT
++#elif DEVELOPMENT || defined(ARM64_BOARD_CONFIG_SWEET)
++	/* Keep opt-in console diagnostics available in SWEET RELEASE kernels. */
+ 	bool enable_kprintf_spam = false;
+ 	if (PE_parse_boot_argn("-enable_kprintf_spam", &enable_kprintf_spam, sizeof(enable_kprintf_spam))) {
+ 		disable_kprintf_output = false;

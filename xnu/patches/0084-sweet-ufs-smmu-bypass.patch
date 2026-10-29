@@ -1,0 +1,164 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 3ace660..6d5397f 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -454,6 +454,122 @@ sweet_ufs_smmu_fault(const char *tag)
+ 	}
+ }
+ 
++/*
++ * Opt-in (boot-arg ufs_smmu=bypass): make the UFS stream (0x60) bypass the
++ * SMMU, so that the physical addresses the driver programs are what the host
++ * controller really uses.
++ *
++ *  - an SMR already matches the stream and its S2CR is TRANSLATE or FAULT:
++ *    only the S2CR type field is changed, every other bit is preserved;
++ *  - no SMR matches and sCR0.USFCFG=1 (unmatched streams fault): an unused
++ *    SMR is programmed to match exactly stream 0x60, with a BYPASS S2CR;
++ *  - the stream already bypasses, or the situation is ambiguous (several
++ *    matching SMRs, SMR scan unavailable): nothing is written.
++ *
++ * Nothing else in the SMMU is touched: sCR0, the other SMRs and all context
++ * banks stay as the firmware left them.  This is the same kind of write the
++ * Linux arm-smmu driver makes for this stream, but it has not been run on the
++ * phone.  The result is read back and reported either way.
++ */
++#define SMMU_TLBIALLNSNH 0x068
++#define SMMU_TLBGSYNC    0x070
++#define SMMU_TLBGSTATUS  0x074
++#define SMMU_TLBGSTATUS_ACTIVE (1u << 0)
++
++static void
++smmu_wr(uint32_t off, uint32_t v)
++{
++	if (!su.smmu || off > SMMU_SIZE - 4) {
++		return;
++	}
++	if (sweet_smmu_diag & SMMU_DIAG_TRACE) {
++		printf("METROID SMMU: write 0x%05x = %08x\n", off, v);
++	}
++	*(volatile uint32_t *)(su.smmu + off) = v;
++	__builtin_arm_dsb(0xf);
++}
++
++static void
++smmu_tlb_sync(void)
++{
++	smmu_wr(SMMU_TLBIALLNSNH, 0);
++	smmu_wr(SMMU_TLBGSYNC, 0);
++	for (int i = 0; i < 1000; i++) {
++		if (!(smmu_rd(SMMU_TLBGSTATUS) & SMMU_TLBGSTATUS_ACTIVE)) {
++			return;
++		}
++		delay(1);
++	}
++	printf("METROID SMMU: TLB sync did not complete (GSACTIVE still set)\n");
++}
++
++static int
++sweet_ufs_smmu_set_bypass(void)
++{
++	enum smmu_verdict v = smmu_ufs_verdict();
++
++	if (!su.smmu || !smmu_st.ok) {
++		printf("METROID SMMU: ufs_smmu=bypass needs the SMMU dump (sweetsmmu != 0) to succeed\n");
++		return ENXIO;
++	}
++	switch (v) {
++	case SMMU_BYPASS:
++	case SMMU_UNMATCHED_BYPASS:
++		printf("METROID SMMU: stream 0x%x already bypasses; nothing to do\n", SMMU_UFS_SID);
++		return 0;
++	case SMMU_TRANSLATE:
++	case SMMU_FAULT: {
++		uint32_t n = (uint32_t)smmu_st.smr_idx;
++		uint32_t want = (smmu_st.s2cr & ~S2CR_TYPE_MASK) | (S2CR_BYPASS << 16);
++		printf("METROID SMMU: S2CR[%u] %08x -> %08x (type bypass)\n", n, smmu_st.s2cr, want);
++		smmu_wr(SMMU_S2CR(n), want);
++		smmu_tlb_sync();
++		uint32_t got = smmu_rd(SMMU_S2CR(n));
++		if (S2CR_TYPE(got) != S2CR_BYPASS) {
++			/* The write did not produce bypass; something else (hypervisor or
++			 * firmware) may own this register and may even have changed it to
++			 * something other than what was written.  Put the old value back. */
++			printf("METROID SMMU: S2CR[%u] reads back %08x, not bypass; restoring %08x\n",
++			    n, got, smmu_st.s2cr);
++			smmu_wr(SMMU_S2CR(n), smmu_st.s2cr);
++			smmu_tlb_sync();
++			printf("METROID SMMU: S2CR[%u] after restore: %08x\n", n, smmu_rd(SMMU_S2CR(n)));
++			return EPERM;
++		}
++		return 0;
++	}
++	case SMMU_UNMATCHED_FAULT: {
++		/* Find an SMR that is not in use; its S2CR is written first so the
++		 * stream is never matched by an SMR with a stale S2CR. */
++		for (uint32_t n = 0; n < smmu_st.nsmr; n++) {
++			if (smmu_rd(SMMU_SMR(n)) & SMR_VALID) {
++				continue;
++			}
++			uint32_t s2cr = S2CR_BYPASS << 16;
++			uint32_t smr = SMR_VALID | SMMU_UFS_SID;
++			printf("METROID SMMU: new SMR[%u]=%08x S2CR[%u]=%08x (stream 0x%x, bypass)\n",
++			    n, smr, n, s2cr, SMMU_UFS_SID);
++			smmu_wr(SMMU_S2CR(n), s2cr);
++			smmu_wr(SMMU_SMR(n), smr);
++			smmu_tlb_sync();
++			if (smmu_rd(SMMU_SMR(n)) != smr || S2CR_TYPE(smmu_rd(SMMU_S2CR(n))) != S2CR_BYPASS) {
++				printf("METROID SMMU: SMR[%u]=%08x S2CR[%u]=%08x read back wrong; undoing\n",
++				    n, smmu_rd(SMMU_SMR(n)), n, smmu_rd(SMMU_S2CR(n)));
++				smmu_wr(SMMU_SMR(n), 0);
++				return EPERM;
++			}
++			return 0;
++		}
++		printf("METROID SMMU: no free SMR for stream 0x%x\n", SMMU_UFS_SID);
++		return ENOSPC;
++	}
++	default:
++		printf("METROID SMMU: stream 0x%x state is ambiguous (%u matching SMRs, scanned=%u); "
++		    "not writing\n", SMMU_UFS_SID, smmu_st.nmatch, smmu_st.scanned);
++		return ENOTSUP;
++	}
++}
++
+ /* Names of the interrupt status bits that explain a stuck request. */
+ static const char *
+ ufs_is_names(uint32_t is, char *buf, size_t n)
+@@ -1030,16 +1146,31 @@ sweet_ufs_init(void)
+ 		sweet_ufs_smmu_dump("init");
+ 	}
+ 	/* The Android DT gives UFS an SMMU stream. A plain PA is NOT normally
+-	 * a legal UFS DMA address. This opt-in is only for users who have
+-	 * independently verified that UFS uses identity-mapped DMA at handoff.
+-	 * Without that verification, stop before changing the UFS host. */
++	 * a legal UFS DMA address. The driver proceeds only if (a) the SMMU
++	 * registers show that the stream bypasses the SMMU, optionally after
++	 * ufs_smmu=bypass made it so, or (b) the user asserts it with
++	 * ufs_dma_identity=1.  Otherwise stop before changing the UFS host. */
++	char smmu_mode[16] = { 0 };
++	PE_parse_boot_argn("ufs_smmu", smmu_mode, sizeof(smmu_mode));
++	smmu_mode[sizeof(smmu_mode) - 1] = '\0';
++	if (strcmp(smmu_mode, "bypass") == 0) {
++		int serr = sweet_ufs_smmu_set_bypass();
++		printf("METROID SMMU: ufs_smmu=bypass: %s (%d)\n", serr ? "failed" : "done", serr);
++		sweet_ufs_smmu_dump("after-bypass");
++	}
++	enum smmu_verdict sv = smmu_ufs_verdict();
++	bool smmu_bypasses = (sv == SMMU_BYPASS || sv == SMMU_UNMATCHED_BYPASS);
+ 	int dma_identity_verified = 0;
+ 	PE_parse_boot_argn("ufs_dma_identity", &dma_identity_verified,
+ 	    sizeof(dma_identity_verified));
+-	if (dma_identity_verified != 1) {
+-		printf("METROID UFS: blocked unsafe DMA (verify SMMU and set ufs_dma_identity=1)\n");
++	if (!smmu_bypasses && dma_identity_verified != 1) {
++		printf("METROID UFS: blocked unsafe DMA: stream 0x%x is %s; "
++		    "boot with ufs_smmu=bypass, or ufs_dma_identity=1 if verified otherwise\n",
++		    SMMU_UFS_SID, smmu_verdict_name[sv]);
+ 		return ENOTSUP;
+ 	}
++	printf("METROID UFS: physical DMA allowed (%s)\n",
++	    smmu_bypasses ? "SMMU registers show bypass" : "ufs_dma_identity=1 asserted");
+ 
+ 	if ((uint64_t)reg[0] != 0x01d84000ULL || reg[1] < 0x3000) {
+ 		printf("METROID UFS: unexpected MMIO range 0x%llx length 0x%llx\n",

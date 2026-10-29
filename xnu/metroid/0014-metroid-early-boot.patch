@@ -1,0 +1,659 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1833,22 +1833,38 @@
+  */
+ #define SWEET_EARLY_FB_VA (VM_MIN_KERNEL_ADDRESS + ARM_TT_L2_SIZE)
+ 
++/* Two private L3 tables in kernel BSS; not allocator-owned. The 64MB gap
++ * below gVirtBase contains only the splash pages and 192KB of display MMIO.
++ * No cacheable aliases to firmware reservations are introduced. */
++static pt_entry_t metroid_console_pt[2][ARM_PGBYTES / sizeof(pt_entry_t)]
++    __attribute__((aligned(ARM_PGBYTES)));
+ static void
+ sweet_early_map_final(void)
+ {
+-	const vm_map_address_t va = SWEET_EARLY_FB_VA;
+-	assert(va + ARM_TT_L2_SIZE <= gVirtBase);
+-	tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
+-	assert((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
+-	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+-	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+-	assert(*slot == ARM_TTE_EMPTY);
+-	*slot = 0x9c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+-	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+-	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+-	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+-	__asm__ volatile("dsb ishst" ::: "memory");
+-}
++    const vm_map_address_t va = SWEET_EARLY_FB_VA;
++    assert(va + 2 * ARM_TT_L2_SIZE <= gVirtBase);
++    tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
++    assert((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
++    tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
++    for (unsigned block = 0; block < 2; block++) {
++        for (unsigned page = 0; page < ARM_PGBYTES / sizeof(pt_entry_t); page++) {
++            uint64_t offset = block * ARM_TT_L2_SIZE + page * ARM_PGBYTES;
++            uint64_t pa = 0xfc000000ULL + offset;
++            unsigned attr = CACHE_ATTRINDX_WRITECOMB;
++            if (offset < 0x30000) { pa = 0x0ae00000 + offset; attr = CACHE_ATTRINDX_DISABLE; }
++            else if (pa < 0xfc800000 || pa >= 0xff300000) continue;
++            metroid_console_pt[block][page] = pa | ARM_PTE_TYPE_VALID |
++                ARM_PTE_SH(SH_OUTER_MEMORY) | ARM_PTE_ATTRINDX(attr) |
++                ARM_PTE_AF | ARM_PTE_PNX | ARM_PTE_NX;
++        }
++        tt_entry_t *slot = &l2[((va + block * ARM_TT_L2_SIZE) & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
++        assert(*slot == ARM_TTE_EMPTY);
++        uint64_t pa = (uint64_t)metroid_console_pt[block] - gVirtBase + gPhysBase;
++        *slot = pa | ARM_TTE_VALID | ARM_TTE_TYPE_TABLE;
++    }
++    __asm__ volatile("dsb ishst" ::: "memory");
++}
++
+ #endif
+ 
+ void
+diff --git a/osfmk/arm64/metroid_console.c b/osfmk/arm64/metroid_console.c
+new file mode 100644
+--- /dev/null
++++ b/osfmk/arm64/metroid_console.c
+@@ -0,0 +1,150 @@
++#define METROID_XNU 1
++/* Command-mode console using the firmware's validated, active linear pipes.
++ * Never changes display routing, buffer addresses, clocks, DSC or power.
++ * Single CPU, no allocator/locks. Refreshes on newline with a bounded delay.
++ */
++#include "metroid_console.h"
++#ifdef METROID_XNU
++extern unsigned char iso_font[256 * 16];
++#else
++#include "../shim/font.h"
++#endif
++static uintptr_t mdp = 0x0ae00000;
++static uint64_t fb_bias;
++static struct surface surfaces[28];
++static unsigned count, controllers, row, col, cols;
++static const uint32_t pipe_offsets[] = {0x5000,0x7000,0x25000,0x27000,0x29000,0x2b000,0x2d000};
++static const uint32_t pipe_bits[] = {16,17,0,1,2,3,4};
++#define SPLASH_START 0xfc800000ULL
++#define SPLASH_END 0xff300000ULL
++static uint32_t rd(uintptr_t a) { return *(volatile uint32_t *)a; }
++static int surface_decode(struct surface *s, uint32_t address, uint32_t size,
++                   uint32_t xy, uint32_t stride, uint32_t format,
++                   uint32_t unpack, uint32_t opmode, uint32_t secure,
++                   uint32_t multirect)
++{
++    uint32_t w = size & 0xffff, h = size >> 16;
++    uint32_t x = xy & 0xffff, y = xy >> 16;
++    stride &= 0xffff;
++    /* Exact 8-bit components, packed four-byte linear RGB, tight unpack.
++     * Reject YUV, tiling/UBWC, rotation, solid fill, FP16/DX and multirect.
++     */
++    if ((format & 0xff) != 0xff || ((format >> 9) & 3) != 3 ||
++        ((format >> 12) & 3) != 3 || !(format & (1u << 17)) ||
++        (format & ((3u << 30) | (3u << 19) | (3u << 23) |
++                   (1u << 22) | (1u << 16) | (1u << 15) |
++                   (1u << 14) | (1u << 11))) ||
++        (opmode & ((1u << 14) | (1u << 13) | 1)) ||
++        secure || multirect)
++        return 0;
++    if ((w != 630 && w != 1260) || h != 2800 || x > 1260 || y != 0 ||
++        stride % 4 || stride < (x + w) * 4 || stride > 16384)
++        return 0;
++    uint64_t end = (uint64_t)address + (uint64_t)(y + h - 1) * stride
++                   + (uint64_t)(x + w) * 4;
++    if (address % 4 || address < SPLASH_START || end > SPLASH_END)
++        return 0;
++    uint32_t seen = 0, black = 0;
++    for (unsigned i = 0; i < 4; ++i) {
++        unsigned element = (unpack >> (i * 8)) & 0xff;
++        if (element > 3 || (seen & (1u << element))) return 0;
++        seen |= 1u << element;
++        if (element == 3) black = 0xffu << (i * 8);
++    }
++    *s = (struct surface){address, w, h, stride, x, y, black};
++    return 1;
++}
++
++
++int metroid_console_init(void)
++{
++    count = controllers = row = col = 0; cols = 78;
++    for (unsigned c = 0; c < 4; c++) {
++        uintptr_t ctl = mdp + 0x16000 + c * 0x1000;
++        uint32_t intf = rd(ctl + 0xf4);
++        if (!intf || (intf & ~6u) || !(rd(ctl + 0x14) & (1u << 17)) ||
++            rd(ctl + 0xec) || rd(ctl + 0xf0)) continue;
++        uint32_t active = rd(ctl + 0x12c);
++        for (unsigned p = 0; p < 7; p++) {
++            if (!(active & (1u << pipe_bits[p]))) continue;
++            uintptr_t pipe = mdp + pipe_offsets[p];
++            struct surface s;
++            if (!surface_decode(&s, rd(pipe+0x14), rd(pipe), rd(pipe+8),
++                rd(pipe+0x24), rd(pipe+0x30), rd(pipe+0x34), rd(pipe+0x38),
++                rd(pipe+0x70), rd(pipe+0x170))) continue;
++            surfaces[count++] = s;
++            if (s.width / 16 < cols) cols = s.width / 16;
++            controllers |= 1u << c;
++        }
++    }
++
++    if (count > 0) {
++        uint64_t bias = fb_bias;
++        for (unsigned i = 0; i < count; i++) {
++            const struct surface s = surfaces[i];
++            volatile uint32_t *fb = fb_pointer(s.address + bias);
++            uint32_t pitch = s.stride / 4;
++            for (uint32_t y = 0; y < s.height; y++) {
++                volatile uint32_t *line = fb + (uint64_t)y * pitch;
++                for (uint32_t x = 0; x < s.width; x++) {
++                    line[x] = s.black;
++                }
++            }
++        }
++    }
++
++    return count != 0;
++}
++static void refresh(void)
++{
++    __asm__ volatile("dsb sy" ::: "memory");
++    for (unsigned c = 0; c < 4; c++)
++        if (controllers & (1u << c))
++            *(volatile uint32_t *)(mdp + 0x1601c + c * 0x1000) = 1;
++    __asm__ volatile("dsb sy" ::: "memory");
++    uint64_t start, now, hz;
++    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(start));
++    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(hz));
++    do { __asm__ volatile("mrs %0, cntpct_el0" : "=r"(now)); }
++    while (now - start < hz / 10);
++}
++void metroid_console_putc(char ch)
++{
++    if (!count) return;
++    if (ch == '\r') { col = 0; return; }
++    if (ch == '\n' || col == cols) {
++        refresh(); col = 0; row = (row + 1) % 70;
++        if (ch == '\n') return;
++    }
++    unsigned c = (unsigned char)ch;
++    if (c < 32 || c > 126) c = '?';
++    for (unsigned p = 0; p < count; p++) {
++        const struct surface *s = &surfaces[p];
++        volatile uint32_t *fb = (void *)(uintptr_t)(s->address + fb_bias);
++        if (!col) {
++            for (unsigned y = 0; y < 32; y++)
++                for (unsigned x = 0; x < s->width; x++)
++                    fb[(uint64_t)(160 + row*32 + y)* (s->stride/4) + s->x+x] = s->black;
++        }
++        for (unsigned gy = 0; gy < 16; gy++)
++            for (unsigned gx = 0; gx < 8; gx++) {
++#ifdef METROID_XNU
++                unsigned ink = iso_font[c*16+gy] & (1u << gx);
++#else
++                unsigned ink = font8x16[c-32][gy] & (0x80u >> gx);
++#endif
++                for (unsigned sy = 0; sy < 2; sy++)
++                    for (unsigned sx = 0; sx < 2; sx++)
++                        fb[(uint64_t)(160+row*32+gy*2+sy)*(s->stride/4)+s->x+col*16+gx*2+sx] = ink ? 0xffffffffu : s->black;
++            }
++    }
++    col++;
++}
++void metroid_console_string(const char *s) { while (*s) metroid_console_putc(*s++); }
++void metroid_console_relocate(uint64_t base)
++{
++    fb_bias = base - 0xfc000000ULL;
++    mdp = (uintptr_t)base;
++    __asm__ volatile("dsb sy; isb" ::: "memory");
++}
++const struct surface *metroid_console_surface(void) { return count ? surfaces : (void *)0; }
+diff --git a/osfmk/arm64/metroid_console.h b/osfmk/arm64/metroid_console.h
+new file mode 100644
+--- /dev/null
++++ b/osfmk/arm64/metroid_console.h
+@@ -0,0 +1,10 @@
++#ifndef METROID_CONSOLE_H
++#define METROID_CONSOLE_H
++#include <stdint.h>
++struct surface { uint64_t address; uint32_t width, height, stride, x, y, black; };
++int metroid_console_init(void);
++void metroid_console_putc(char c);
++void metroid_console_string(const char *s);
++void metroid_console_relocate(uint64_t base);
++const struct surface *metroid_console_surface(void);
++#endif
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -463,24 +463,7 @@
+ 	mov		x20, x0
+ 	mov		x21, #0
+ 
+-#if defined(SWEET)
+-	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+-	MOV64	x0, (0x9c000000 + 2368 * 4320)
+-	mov		w1, #-1
+-	mov		x2, #32
+-	mov		x4, #4320
+-Lsweet_mark_row:
+-	mov		x3, #64
+-	mov		x5, x0
+-Lsweet_mark_pixel:
+-	str		w1, [x5], #4
+-	subs	x3, x3, #1
+-	b.ne	Lsweet_mark_pixel
+-	add		x0, x0, x4
+-	subs	x2, x2, #1
+-	b.ne	Lsweet_mark_row
+-	dsb		sy
+-#endif
++/* Metroid: no hardcoded Sweet framebuffer access before MMU. */
+ 
+ 	// Set low reset vector before attempting any loads
+ 	adrp	x0, EXT(LowExceptionVectorBase)@page
+@@ -628,22 +611,28 @@
+ 	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
+ 	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
+ 
+-#if defined(SWEET)
+-	/*
+-	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
+-	 * L2 table. Both framebuffer and RAM use L1 index 0; another call to
+-	 * create_bootstrap_mapping would replace the RAM L2 table.
+-	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
+-	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
+-	 */
+-	MOV64	x10, 0x9c000000
+-	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+-	orr		x11, x11, x10
+-	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+-	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+-	add		x13, x25, #(2 * PGBYTES)
+-	str		x11, [x13, x12, lsl #TTE_SHIFT]
+-#endif
++/* Kernel RAM at 0x8c0000000 and these device windows share L1 index 0.
++     * Reuse the existing V=P L2 page; never replace its RAM entries. */
++    add x13, x25, #(2 * PGBYTES)
++    MOV64 x10, 0xfc000000
++    MOV64 x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
++    orr x11, x11, x10
++    and x12, x10, #(ARM_TT_L2_INDEX_MASK)
++    lsr x12, x12, #(ARM_TT_L2_SHIFT)
++    str x11, [x13, x12, lsl #TTE_SHIFT]
++    MOV64 x10, 0xfe000000
++    MOV64 x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
++    orr x11, x11, x10
++    and x12, x10, #(ARM_TT_L2_INDEX_MASK)
++    lsr x12, x12, #(ARM_TT_L2_SHIFT)
++    str x11, [x13, x12, lsl #TTE_SHIFT]
++    MOV64 x10, 0xa000000
++    MOV64 x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_DISABLE) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
++    orr x11, x11, x10
++    and x12, x10, #(ARM_TT_L2_INDEX_MASK)
++    lsr x12, x12, #(ARM_TT_L2_SHIFT)
++    str x11, [x13, x12, lsl #TTE_SHIFT]
++
+ 
+ 	/* Ensure TTEs are visible */
+ 	dsb		ish
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -1,143 +1,30 @@
+-/*
+- * Redmi Note 10 Pro bootstrap console. No allocation, locks, ADT parsing or
+- * per-CPU state: panic() can reach this before a current thread exists.
+- * start.s maps the splash framebuffer VA=PA as Normal Non-Cacheable memory.
+- * arm_vm_init installs a reserved kernel VA alias before removing TTBR0;
+- * retain this console until the normal framebuffer serial console is ready.
+- */
++/* Metroid early diagnostics; console remains available as the serial sink. */
+ #include <arm64/sweet_early.h>
+-
+-#if defined(SWEET)
+-#include <stdint.h>
+ #include <kern/misc_protos.h>
+-
+-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
+-#define EARLY_FB early_fb
+-#define EARLY_WIDTH 1080u
+-#define EARLY_HEIGHT 2400u
+-#define EARLY_STRIDE (4320u / 4)
+-#define EARLY_SCALE 2u
+-#define EARLY_CELL_W (8u * EARLY_SCALE)
+-#define EARLY_CELL_H (16u * EARLY_SCALE)
+-#define EARLY_ROWS ((EARLY_HEIGHT - 32u) / EARLY_CELL_H)
+-#define EARLY_COLS (EARLY_WIDTH / EARLY_CELL_W)
+-
+-extern unsigned char iso_font[256 * 16];
+-
+-/* Initialized data must remain writable until disable, including panics. */
+-static unsigned int early_row, early_col;
+-static unsigned int early_started, early_disabled, early_panicking;
+-
+-static void
+-sweet_early_clear_row(void)
++#include "metroid_console.h"
++static unsigned started, panicking;
++void sweet_early_putc(char c) { metroid_console_putc(c); }
++void sweet_early_mark(unsigned stage, const char *label)
+ {
+-	for (unsigned int y = 0; y < EARLY_CELL_H; y++) {
+-		volatile uint32_t *line = EARLY_FB + (early_row * EARLY_CELL_H + y) * EARLY_STRIDE;
+-		for (unsigned int x = 0; x < EARLY_WIDTH; x++) {
+-			line[x] = 0xff000000u;
+-		}
+-	}
++    if (!started) { started = 1; metroid_console_init(); }
++    metroid_console_string("METROID XNU ");
++    if (stage >= 10) metroid_console_putc('0' + stage / 10);
++    metroid_console_putc('0' + stage % 10);
++    metroid_console_string(": "); metroid_console_string(label);
++    metroid_console_putc('\n');
+ }
+-
+-void
+-sweet_early_putc(char c)
++void sweet_early_relocate(uint64_t base)
+ {
+-	if (early_disabled) {
+-		return;
+-	}
+-	if (!early_started) {
+-		early_started = 1;
+-		sweet_early_clear_row();
+-	}
+-	if (c == '\r') {
+-		early_col = 0;
+-		return;
+-	}
+-	if (c == '\n' || early_col == EARLY_COLS) {
+-		early_col = 0;
+-		early_row = (early_row + 1) % EARLY_ROWS;
+-		sweet_early_clear_row();
+-		if (c == '\n') {
+-			return;
+-		}
+-	}
+-	const unsigned char *glyph = iso_font + (unsigned char)c * 16;
+-	for (unsigned int gy = 0; gy < 16; gy++) {
+-		for (unsigned int sy = 0; sy < EARLY_SCALE; sy++) {
+-			volatile uint32_t *line = EARLY_FB +
+-			    (early_row * EARLY_CELL_H + gy * EARLY_SCALE + sy) * EARLY_STRIDE +
+-			    early_col * EARLY_CELL_W;
+-			for (unsigned int gx = 0; gx < 8; gx++) {
+-				uint32_t pixel = (glyph[gy] & (1u << gx)) ? 0xffffffffu : 0xff000000u;
+-				for (unsigned int sx = 0; sx < EARLY_SCALE; sx++) {
+-					line[gx * EARLY_SCALE + sx] = pixel;
+-				}
+-			}
+-		}
+-	}
+-	early_col++;
++    metroid_console_relocate(base);
++    sweet_early_mark(9, "final console mappings live");
+ }
+-
+-static void
+-sweet_early_string(const char *s)
++void sweet_early_disable(void) { /* also used by the normal serial sink */ }
++void sweet_early_panic(const char *fmt, va_list *args)
+ {
+-	while (*s) {
+-		sweet_early_putc(*s++);
+-	}
++    if (panicking) return;
++    panicking = 1;
++    metroid_console_string("\nMETROID PANIC: ");
++    va_list copy; va_copy(copy, *args);
++    _doprnt(fmt, &copy, sweet_early_putc, 16);
++    va_end(copy); metroid_console_putc('\n');
+ }
+-
+-void
+-sweet_early_mark(unsigned int stage, const char *label)
+-{
+-	if (early_disabled || stage > 20) {
+-		return;
+-	}
+-	uint32_t color = 0xff00ff00u | ((stage & 7u) * 32u << 16);
+-	for (unsigned int y = EARLY_HEIGHT - 32; y < EARLY_HEIGHT; y++) {
+-		for (unsigned int x = stage * 48; x < (stage + 1) * 48; x++) {
+-			EARLY_FB[y * EARLY_STRIDE + x] = color;
+-		}
+-	}
+-	__asm__ volatile("dsb sy" ::: "memory");
+-	sweet_early_string("SWEET EARLY ");
+-	if (stage >= 10) {
+-		sweet_early_putc((char)('0' + stage / 10));
+-	}
+-	sweet_early_putc((char)('0' + stage % 10));
+-	sweet_early_string(": ");
+-	sweet_early_string(label);
+-	sweet_early_putc('\n');
+-}
+-
+-void
+-sweet_early_panic(const char *fmt, va_list *args)
+-{
+-	if (early_disabled || early_panicking) {
+-		return;
+-	}
+-	early_panicking = 1;
+-	sweet_early_string("\nSWEET EARLY PANIC: ");
+-	va_list copy;
+-	va_copy(copy, *args);
+-	_doprnt(fmt, &copy, sweet_early_putc, 16);
+-	va_end(copy);
+-	sweet_early_putc('\n');
+-	__asm__ volatile("dsb sy" ::: "memory");
+-}
+-
+-void
+-sweet_early_relocate(uint64_t base)
+-{
+-	sweet_early_mark(8, "leaving bootstrap TTBR0");
+-	early_fb = (volatile uint32_t *)(uintptr_t)base;
+-	__asm__ volatile("dsb sy" ::: "memory");
+-	sweet_early_mark(9, "kernel framebuffer VA live");
+-}
+-
+-void
+-sweet_early_disable(void)
+-{
+-	early_disabled = 1;
+-	__asm__ volatile("dsb sy" ::: "memory");
+-}
+-#endif /* SWEET */
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -105,3 +105,5 @@
+ osfmk/arm64/corecrypto/sha256_compress_arm64.s	standard
+ 
+ osfmk/arm/counter.c	standard
++
++osfmk/arm64/metroid_console.c standard
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -698,149 +698,18 @@
+ 	gPESF = fns;
+ }
+ 
+-/*****************************************************************************/
+-
+-/*
+- * sweet: framebuffer "serial" for boards with no usable UART (the Redmi Note
+- * 10 Pro's debug UART engine runs in SPI mode). kprintf output is drawn onto
+- * the boot framebuffer described by the ADT node "sweet-fbcon":
+- *   reg    = <phys size>       absolute physical address, not arm-io relative
+- *   width, height              pixels
+- *   stride                     bytes per line, 32bpp
+- * Lines wrap back to the top instead of scrolling; the line after the cursor
+- * is kept blank so the newest output is easy to find.
+- */
+-
+-extern unsigned char iso_font[256 * 16];
+-
+-#define FBCON_SCALE     2
+-#define FBCON_FG        0xffffffffu
+-#define FBCON_BG        0xff000000u
+-
+-static volatile uint32_t *fbcon_base;
+-static uint32_t fbcon_width, fbcon_height, fbcon_stride;
+-static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
+-
+-static void
+-fbcon_clear_row(uint32_t row)
+-{
+-	for (uint32_t y = row * 16 * FBCON_SCALE; y < (row + 1) * 16 * FBCON_SCALE; y++) {
+-		volatile uint32_t *line = fbcon_base + y * (fbcon_stride / 4);
+-		for (uint32_t x = 0; x < fbcon_width; x++) {
+-			line[x] = FBCON_BG;
+-		}
+-	}
+-}
+-
+-static void
+-fbcon_newline(void)
+-{
+-	fbcon_col = 0;
+-	fbcon_row = (fbcon_row + 1) % fbcon_rows;
+-	fbcon_clear_row(fbcon_row);
+-	fbcon_clear_row((fbcon_row + 1) % fbcon_rows);
+-}
+-
+-static void
+-fbcon_init(void)
+-{
+-	fbcon_cols = fbcon_width / (8 * FBCON_SCALE);
+-	fbcon_rows = fbcon_height / (16 * FBCON_SCALE);
+-	fbcon_col = fbcon_row = 0;
+-	for (uint32_t r = 0; r < fbcon_rows; r++) {
+-		fbcon_clear_row(r);
+-	}
+-}
+-
+-static unsigned int
+-fbcon_transmit_ready(void)
+-{
+-	return 1;
+-}
+-
+-static void
+-fbcon_transmit_data(uint8_t c)
+-{
+-	if (c == '\r') {
+-		fbcon_col = 0;
+-		return;
+-	}
+-	if (c == '\n') {
+-		fbcon_newline();
+-		return;
+-	}
+-	if (fbcon_col >= fbcon_cols) {
+-		fbcon_newline();
+-	}
+-	const unsigned char *glyph = iso_font + c * 16;
+-	uint32_t x0 = fbcon_col * 8 * FBCON_SCALE, y0 = fbcon_row * 16 * FBCON_SCALE;
+-	for (uint32_t gy = 0; gy < 16; gy++) {
+-		for (uint32_t sy = 0; sy < FBCON_SCALE; sy++) {
+-			volatile uint32_t *line = fbcon_base + (y0 + gy * FBCON_SCALE + sy) * (fbcon_stride / 4) + x0;
+-			for (uint32_t gx = 0; gx < 8; gx++) {
+-				uint32_t px = (glyph[gy] & (1u << gx)) ? FBCON_FG : FBCON_BG;
+-				for (uint32_t sx = 0; sx < FBCON_SCALE; sx++) {
+-					line[gx * FBCON_SCALE + sx] = px;
+-				}
+-			}
+-		}
+-	}
+-	fbcon_col++;
+-}
+-
+-static unsigned int
+-fbcon_receive_ready(void)
+-{
+-	return 0;
+-}
+-
+-static uint8_t
+-fbcon_receive_data(void)
+-{
+-	return 0;
+-}
+-
+-SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) sweet_fbcon_serial_functions =
+-{
+-	.init = fbcon_init,
+-	.transmit_ready = fbcon_transmit_ready,
+-	.transmit_data = fbcon_transmit_data,
+-	.receive_ready = fbcon_receive_ready,
+-	.receive_data = fbcon_receive_data,
+-	.device = SERIAL_SWEET_FBCON
++/* Reuse the permanent Metroid console; no second framebuffer mapping. */
++static void metroid_serial_init(void) {}
++static unsigned int metroid_tx_ready(void) { return 1; }
++static unsigned int metroid_rx_ready(void) { return 0; }
++static uint8_t metroid_rx(void) { return 0; }
++static void metroid_tx(uint8_t c) { sweet_early_putc((char)c); }
++SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) metroid_serial = {
++    .init = metroid_serial_init, .transmit_ready = metroid_tx_ready,
++    .transmit_data = metroid_tx, .receive_ready = metroid_rx_ready,
++    .receive_data = metroid_rx, .device = SERIAL_SWEET_FBCON
+ };
+-
+-static void
+-fbcon_probe(void)
+-{
+-	DTEntry entry;
+-	uint64_t const *reg;
+-	uint32_t const *val;
+-	unsigned int size;
+-
+-	if (SecureDTFindEntry("name", "sweet-fbcon", &entry) != kSuccess ||
+-	    SecureDTGetProperty(entry, "reg", (void const **)&reg, &size) != kSuccess || size < 16) {
+-		return;
+-	}
+-	if (SecureDTGetProperty(entry, "width", (void const **)&val, &size) == kSuccess) {
+-		fbcon_width = *val;
+-	}
+-	if (SecureDTGetProperty(entry, "height", (void const **)&val, &size) == kSuccess) {
+-		fbcon_height = *val;
+-	}
+-	if (SecureDTGetProperty(entry, "stride", (void const **)&val, &size) == kSuccess) {
+-		fbcon_stride = *val;
+-	}
+-	if (!fbcon_width || !fbcon_height || fbcon_stride < fbcon_width * 4) {
+-		return;
+-	}
+-	sweet_early_mark(17, "fbcon config read; mapping");
+-	fbcon_base = (volatile uint32_t *)ml_io_map_wcomb(reg[0], reg[1]);
+-	sweet_early_mark(18, "fbcon mapping returned");
+-	if (fbcon_base != NULL) {
+-		register_serial_functions(&sweet_fbcon_serial_functions);
+-	}
+-}
++static void fbcon_probe(void) { register_serial_functions(&metroid_serial); }
+ 
+ #if HIBERNATION
+ /**
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -39,12 +39,12 @@
+  * virt, hyp) instead of the usual 13/14/11/10: the virtual timer XNU uses
+  * (CNTV) is INTID 16 + 3 = 19.
+  */
+-#define SWEET_VTIMER_INTID        19
++#define SWEET_VTIMER_INTID        27
+ #define SWEET_IPI_SGI             1       // SGI used for cross-CPU signals
+ 
+ #define GIC_SPURIOUS_IRQ          1023    // IRQ no. for GIC spurious interrupt
+ 
+-#define GICR_PE_SIZE              0x20000 // Size of each redistributor region
++#define GICR_PE_SIZE              0x40000 // Size of each redistributor region
+ 
+ /* GICv3 register definitions; see GICv3 spec (Arm IHI 0069G) */
+ #define GICD_CTLR                 0x0

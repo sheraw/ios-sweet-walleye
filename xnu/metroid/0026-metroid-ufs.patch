@@ -1,0 +1,2074 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1,25 +1,8 @@
+ /*
+- * METROID / Nothing Phone (3) internal UFS root device.
+- *
+- * Experimental bare-metal handoff driver. UFSHCI version and MCQ/legacy
+- * availability must be checked at runtime. No controller reset/PHY re-init
+- * is performed. Only use with a validated DMA identity mapping; a boot argument
+- * is required to opt into physical-address DMA until an SMMU DMA mapper exists.
+- * A valid UTRL base register readback is NOT evidence of a working DMA mapping.
+- * Commands use polled legacy single-doorbell mode only,
+- * one at a time, to LUN 0. It finds one GPT partition by name (boot-arg
+- * ufsroot=, default "userdata") and exposes it as the BSD disk ufsroot0
+- * (rufsroot0), with 512-byte logical sectors over the device's 4 KiB blocks.
+- * Root on it with rd=ufsroot0.
+- *
+- * DMA uses one physically contiguous allocation and a 1 MiB bounce buffer.
+- * Device-tree marks the UFS endpoint dma-coherent, but firmware SMMU mappings
+- * remain unknown. Cache maintenance is inherited from the experimental code
+- * and needs target-XNU validation. Writes are disabled by default.
+- * Experimental writes additionally require ufsrw=1 and an exact
+- * ufsrw_partition= name for a dedicated metroid_/xnu_ GPT partition.
+- * Never enable writes on an Android-owned partition or without a verified
+- * SMMU DMA mapping; these flags do not make an unsafe controller safe.
++ * Nothing Phone (3) UFS root adapter, backed by an SMMUv2 DMA domain.
++ * Transport sequencing follows Nothing's SM8735 Linux driver; XNU retains
++ * ownership of allocation, serialization and BSD device publication.
++ * Firmware must leave PHY/clocks and a legacy-capable host powered.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_METROID)
+ #include <sys/param.h>
+@@ -43,383 +26,183 @@
+ #include <libkern/libkern.h>
+ 
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+-/* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+-/* osfmk/arm/cpu_data.h, not exported to the BSD layer */
+ extern int get_preemption_level(void);
+ 
+-#define REG_CAP         0x00
+-#define REG_VER         0x08
+-#define REG_UFS_MEM_CFG 0x300
+-#define UFS_MCQ_SELECTED (1u << 0)
+-#define UFS_CAP_LSDB_REMOVED (1u << 29)
+-#define UFS_CAP_MCQ_SUPPORTED (1u << 30)
+-#define UFS_CAP_64BIT_SUPPORTED (1u << 24)
+-#define REG_IS          0x20
+-#define REG_IE          0x24
+-#define REG_HCS         0x30
+-#define REG_HCE         0x34
+-#define REG_UTRLBA      0x50
+-#define REG_UTRLBAU     0x54
+-#define REG_UTRLDBR     0x58
+-#define REG_UTRLCLR     0x5c
+-#define REG_UTRLRSR     0x60
+-
+-#define HCS_DP          (1u << 0)
+-#define HCS_UTRLRDY     (1u << 1)
+-
+-#define UFS_BLOCK       4096u
+-#define BOUNCE_SIZE     (1u << 20)
+-#define PRDT_CHUNK      (256u << 10)            /* PRDT byte count field: 18 bits */
+-#define PRDT_MAX        (BOUNCE_SIZE / PRDT_CHUNK)
+-#define CMD_TIMEOUT_NS  (5ull * NSEC_PER_SEC)
+-#define CMD_SPIN_NS     (50ull * NSEC_PER_USEC)
+-#define CMD_SLEEP_NS    (200ull * NSEC_PER_USEC)
+-
+-struct utrd {
+-	uint32_t dw0, dw1, dw2, dw3;
+-	uint32_t ucdba, ucdbau;
+-	uint32_t resp;          /* [31:16] response UPIU offset, [15:0] length, DWORDs */
+-	uint32_t prdt;          /* [31:16] PRDT offset (DWORDs), [15:0] entries */
+-};
+-
+-struct ucd {
+-	uint8_t cmd[512];
+-	uint8_t resp[512];
+-	struct {
+-		uint32_t addr_lo, addr_hi, rsvd, dbc;
+-	} prdt[PRDT_MAX];
+-};
+-
+-/* Layout of the contiguous DMA allocation. */
+-#define DMA_UTRL        0x0000                  /* 1 KiB aligned */
+-#define DMA_UCD         0x1000                  /* 128 byte aligned */
+-#define DMA_BOUNCE      0x4000
+-#define DMA_SIZE        (DMA_BOUNCE + BOUNCE_SIZE)
++/* Keep ownership of slot zero/bounce memory while sleeping. Never block
++ * during early bootstrap, with IRQs masked, or in a non-preemptible context. */
++static bool
++metroid_ufs_wait_us(uint32_t us)
++{
++	static uint8_t wait_event;
++	if (!ml_get_interrupts_enabled() || get_preemption_level()) { return false; }
++	uint64_t interval;
++	nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &interval);
++	uint64_t deadline = mach_absolute_time() + interval;
++	if (assert_wait_deadline_with_leeway((event_t)&wait_event, THREAD_UNINT,
++	    TIMEOUT_URGENCY_SYS_CRITICAL, deadline, 0) != THREAD_WAITING) { return false; }
++	thread_block(THREAD_CONTINUE_NULL);
++	return true;
++}
+ 
++static uint64_t
++metroid_ufs_now_us(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_USEC;
++}
++#define MU_NOW_US() metroid_ufs_now_us()
++#define MU_DELAY(us) delay((int)(us))
++#define MU_WAIT_US(us) metroid_ufs_wait_us(us)
++#define MU_BARRIER() __builtin_arm_dsb(0xf)
++#define MU_READ32(a) (*(volatile uint32_t *)(uintptr_t)(a))
++#define MU_WRITE32(a, v) (*(volatile uint32_t *)(uintptr_t)(a) = (v))
++#define MU_WRITE64(a, v) (*(volatile uint64_t *)(uintptr_t)(a) = (v))
++/* The private DMA domain has no Linux DMA API/coherency initialization.
++ * Operate on our owning CPU VA and force writes to PoC, even when the
++ * generic physical-address cache wrapper was built as coherent-I/O only.
++ * SWEET/METROID uses the generic ARM CVAC/CIVAC cache implementation. */
++#define MU_CLEAN(va, n) CleanPoC_DcacheRegion_Force((vm_offset_t)(va), (n))
++#define MU_FLUSH(va, n) FlushPoC_DcacheRegion((vm_offset_t)(va), (n))
++#define MU_LOG(...) printf(__VA_ARGS__)
++#include "metroid_ufs.h"
++
++#define BOUNCE_SIZE MU_BOUNCE
++#define DMA_BOUNCE MU_DATA
++#define UFS_BLOCK su.blocksize
+ static struct {
+-	vm_offset_t regs;
+-	vm_offset_t dma;                        /* kernel VA of the DMA allocation */
+-	uint64_t dma_pa;
++	struct mu_host host;
++	vm_offset_t dma;
++	uint64_t first_block, nblocks, total_blocks;
++	uint32_t blocksize, secsize;
+ 	uint8_t lun;
+-	uint8_t tag;
+-	uint64_t first_block, nblocks;          /* partition, in 4 KiB device blocks */
+-	uint32_t secsize;                       /* logical sector size for the BSD layer */
+-	bool writable;                          /* explicit dedicated-partition opt-in */
+-	bool cache;                             /* boot-arg ufscache=1 */
+-	bool wait;                              /* boot-arg ufswait=1 */
+-	bool io_failed;                         /* timeout: do not reuse outstanding DMA */
+ 	int bmajor, cmajor;
+ 	dev_t bdev;
+-	bool ready;
++	bool ready, writable, io_failed;
++	bool cache_dirty; /* protected by sweet_ufs_lock; clear only after successful sync */
++	bool attempted;
++	int init_error;
+ } su;
+-
+-static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
++static LCK_GRP_DECLARE(sweet_ufs_grp, "metroid_ufs");
+ static LCK_MTX_DECLARE(sweet_ufs_lock, &sweet_ufs_grp);
+ 
+-static inline uint32_t
+-ufs_rd(uint32_t off)
+-{
+-	return *(volatile uint32_t *)(su.regs + off);
+-}
+-
+-static inline void
+-ufs_wr(uint32_t off, uint32_t v)
+-{
+-	*(volatile uint32_t *)(su.regs + off) = v;
+-}
+-
+-static void
+-dma_sync(uint32_t off, uint32_t len)
+-{
+-	flush_dcache64((addr64_t)(su.dma_pa + off), len, TRUE);
+-}
+-
+-static void
+-dma_clean(uint32_t off, uint32_t len)
++static int
++ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ {
+-	clean_dcache64((addr64_t)(su.dma_pa + off), len, TRUE);
++	int error = mu_scsi(&su.host, su.lun, cdb, cdb_len, len, write);
++	su.io_failed = su.host.failed;
++	return error;
+ }
+ 
+-/*
+- * One SCSI command in slot 0. For write=true the bounce buffer already
+- * holds outgoing bytes; for read the controller fills it on completion.
+- * A timed-out request is never retried or overwritten with a fresh UTRD.
+- */
+ static int
+-ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
++ufs_rw_blocks(uint64_t lba, uint32_t count, bool write)
+ {
+-	if (su.io_failed) {
+-		return EIO;
+-	}
+-	if (!cdb || !cdb_len || cdb_len > 16 || len > BOUNCE_SIZE ||
+-	    (write && !len)) {
+-		return EINVAL;
+-	}
+-	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
+-	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
+-	uint64_t ucd_pa = su.dma_pa + DMA_UCD, bounce_pa = su.dma_pa + DMA_BOUNCE;
+-
+-	assert(len <= BOUNCE_SIZE);
+-	bzero(utrd, sizeof(*utrd));
+-	bzero(ucd, sizeof(*ucd));
+-
+-	ucd->cmd[0] = 0x01;                     /* COMMAND UPIU */
+-	ucd->cmd[1] = len ? (write ? 0x20 : 0x40) : 0x00; /* data out / in */
+-	ucd->cmd[2] = su.lun;
+-	ucd->cmd[3] = ++su.tag;
+-	ucd->cmd[12] = (uint8_t)(len >> 24);
+-	ucd->cmd[13] = (uint8_t)(len >> 16);
+-	ucd->cmd[14] = (uint8_t)(len >> 8);
+-	ucd->cmd[15] = (uint8_t)len;
+-	memcpy(&ucd->cmd[16], cdb, cdb_len);
+-
+-	/* UFSHCI DD: 1 host-to-device, 2 device-to-host. */
+-	utrd->dw0 = (1u << 28) | ((len ? (write ? 1u : 2u) : 0u) << 25) | (1u << 24);
+-	utrd->dw2 = 0x0f;                       /* OCS invalid until updated */
+-	utrd->ucdba = (uint32_t)ucd_pa;
+-	utrd->ucdbau = (uint32_t)(ucd_pa >> 32);
+-	utrd->resp = (512u / 4) << 16 | (512u / 4);
+-	if (len) {
+-		uint32_t n = 0;
+-		for (uint32_t done = 0; done < len; done += PRDT_CHUNK, n++) {
+-			uint32_t chunk = MIN(PRDT_CHUNK, len - done);
+-			ucd->prdt[n].addr_lo = (uint32_t)(bounce_pa + done);
+-			ucd->prdt[n].addr_hi = (uint32_t)((bounce_pa + done) >> 32);
+-			ucd->prdt[n].dbc = chunk - 1;
+-		}
+-		/* UFSHCI DW7: upper 16 bits OFFSET in DWORDs, lower 16 bits LENGTH. */
+-		utrd->prdt = ((1024u / 4) << 16) | n;
+-	}
+-
+-	if (su.cache) {
+-		dma_clean(DMA_UTRL, sizeof(*utrd));
+-		dma_clean(DMA_UCD, 16 + cdb_len);
+-		dma_sync(DMA_UCD + offsetof(struct ucd, resp), sizeof(ucd->resp));
+-		if (len) {
+-			dma_clean(DMA_UCD + offsetof(struct ucd, prdt),
+-			    (utrd->prdt & 0xffff) * sizeof(ucd->prdt[0]));
+-		}
+-	} else {
+-		dma_sync(DMA_UTRL, sizeof(*utrd));
+-		dma_sync(DMA_UCD, sizeof(*ucd));
+-	}
+-	if (len) {
+-		if (su.cache && write) {
+-			dma_clean(DMA_BOUNCE, len);
+-		} else {
+-			dma_sync(DMA_BOUNCE, len);
+-		}
+-	}
+-	__builtin_arm_dsb(0xf);
+-
+-	ufs_wr(REG_UTRLDBR, 1);
+-	uint64_t deadline;
+-	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
+-	deadline += mach_absolute_time();
+-	bool sleepable = su.wait && su.ready && ml_get_interrupts_enabled() &&
+-	    !ml_at_interrupt_context() && get_preemption_level() == 0;
+-	uint64_t spin_until = 0, sleep_interval = 0;
+-	if (sleepable) {
+-		nanoseconds_to_absolutetime(CMD_SPIN_NS, &spin_until);
+-		spin_until += mach_absolute_time();
+-		nanoseconds_to_absolutetime(CMD_SLEEP_NS, &sleep_interval);
+-	}
+-	while (ufs_rd(REG_UTRLDBR) & 1) {
+-		uint64_t now = mach_absolute_time();
+-		if (now > deadline) {
+-			su.io_failed = true;  /* pending request may still DMA */
+-			printf("METROID UFS TIMEOUT: cmd=%02x IS=%08x HCS=%08x HCE=%08x "
+-			    "DBR=%08x RSR=%08x UTRD_OCS=%08x UPIU=%02x\n",
+-			    cdb[0], ufs_rd(REG_IS), ufs_rd(REG_HCS), ufs_rd(REG_HCE),
+-			    ufs_rd(REG_UTRLDBR), ufs_rd(REG_UTRLRSR), utrd->dw2, ucd->resp[0]);
+-			/* Do not blindly clear in-flight requests on an unknown MCQ/SMMU setup. */
+-			return ETIMEDOUT;
+-		}
+-		if (sleepable && now >= spin_until) {
+-			uint64_t wake = now + MIN(sleep_interval, deadline - now);
+-			/* Keep the mutex: slot 0 and the bounce buffer are still owned. */
+-			if (assert_wait_deadline_with_leeway((event_t)&su.wait, THREAD_UNINT,
+-			    TIMEOUT_URGENCY_SYS_CRITICAL, wake, 0) == THREAD_WAITING) {
+-				thread_block(THREAD_CONTINUE_NULL);
+-			}
+-		} else {
+-			delay(1);
+-		}
+-	}
+-	__builtin_arm_dsb(0xf);
+-	ufs_wr(REG_IS, ufs_rd(REG_IS));         /* acknowledge completion status */
+-
+-	dma_sync(DMA_UTRL, sizeof(*utrd));
+-	if (su.cache) {
+-		dma_sync(DMA_UCD + offsetof(struct ucd, resp), sizeof(ucd->resp));
+-	} else {
+-		dma_sync(DMA_UCD, sizeof(*ucd));
+-	}
+-	if (len && !(su.cache && write)) {
+-		dma_sync(DMA_BOUNCE, len);
+-	}
+-
+-	uint32_t ocs = utrd->dw2 & 0xff;
+-	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
+-		printf("SWEET UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
+-		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
+-		if (write) {
+-			su.io_failed = true; /* Write completion may be ambiguous. */
+-		}
+-		return EIO;
+-	}
+-	return 0;
++	if (!count || count > BOUNCE_SIZE / su.blocksize || lba >= su.total_blocks ||
++	    count > su.total_blocks - lba) { return EINVAL; }
++	if (write && (!su.writable || lba < su.first_block ||
++	    lba - su.first_block >= su.nblocks || count > su.nblocks - (lba - su.first_block))) { return EROFS; }
++	/* READ/WRITE(16): no artificial 32-bit LBA ceiling. */
++	uint8_t cdb[16] = { 0 };
++	cdb[0] = write ? 0x8a : 0x88;
++	for (unsigned i = 0; i < 8; i++) { cdb[2 + i] = (uint8_t)(lba >> (56 - i * 8)); }
++	for (unsigned i = 0; i < 4; i++) { cdb[10 + i] = (uint8_t)(count >> (24 - i * 8)); }
++	/* An unsuccessful write may still have reached the device cache. */
++	if (write) { su.cache_dirty = true; }
++	return ufs_scsi(cdb, sizeof(cdb), count * su.blocksize, write);
+ }
+-
+-/* READ(10) of count device blocks at lba into the bounce buffer. */
++static int ufs_read_blocks(uint64_t lba, uint32_t count) { return ufs_rw_blocks(lba, count, false); }
++static int ufs_write_blocks(uint64_t lba, uint32_t count) { return ufs_rw_blocks(lba, count, true); }
+ static int
+-ufs_read_blocks(uint64_t lba, uint32_t count)
++ufs_sync_cache(void)
+ {
+-	if (lba > UINT32_MAX || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
+-	    count - 1 > UINT32_MAX - lba) {
+-		return EINVAL;
+-	}
+-	uint8_t cdb[10] = {
+-		0x28, 0,
+-		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
+-		0, (uint8_t)(count >> 8), (uint8_t)count, 0
+-	};
+-	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, false);
++	if (su.io_failed || su.host.failed) { return EIO; }
++	/* All writes and flushes share the adapter lock. A clean cache needs no
++	 * second device-wide flush; never elide a flush following any write. */
++	if (!su.cache_dirty) { return 0; }
++	const uint8_t cdb[16] = { 0x91 };
++	int error = ufs_scsi(cdb, sizeof(cdb), 0, false);
++	if (!error) { su.cache_dirty = false; }
++	return error;
+ }
+ 
+-/* WRITE(10) to device LBAs: final partition-boundary enforcement. */
+-static int
+-ufs_write_blocks(uint64_t lba, uint32_t count)
++static uint32_t mu_be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
++static uint64_t mu_be64(const uint8_t *p) { return (uint64_t)mu_be32(p) << 32 | mu_be32(p + 4); }
++static uint32_t mu_le32(const uint8_t *p) { return (uint32_t)p[3] << 24 | (uint32_t)p[2] << 16 | (uint32_t)p[1] << 8 | p[0]; }
++static uint64_t mu_le64(const uint8_t *p) { return (uint64_t)mu_le32(p + 4) << 32 | mu_le32(p); }
++
++static uint32_t
++mu_crc32(const uint8_t *data, uint32_t len)
+ {
+-	if (!su.writable || su.io_failed) {
+-		return EROFS;
++	uint32_t crc = UINT32_MAX;
++	for (uint32_t i = 0; i < len; i++) {
++		crc ^= data[i];
++		for (unsigned bit = 0; bit < 8; bit++) { crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1))); }
+ 	}
+-	if (!su.nblocks || !count || count > BOUNCE_SIZE / UFS_BLOCK ||
+-	    lba > UINT32_MAX || count - 1 > UINT32_MAX - lba ||
+-	    lba < su.first_block || lba - su.first_block >= su.nblocks ||
+-	    count > su.nblocks - (lba - su.first_block)) {
+-		printf("METROID UFS: rejected out-of-partition write lba=0x%llx blocks=%u\n",
+-		    (unsigned long long)lba, count);
+-		return EPERM;
+-	}
+-	uint8_t cdb[10] = {
+-		0x2a, 0,
+-		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16),
+-		(uint8_t)(lba >> 8), (uint8_t)lba,
+-		0, (uint8_t)(count >> 8), (uint8_t)count, 0
+-	};
+-	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, true);
++	return ~crc;
+ }
+ 
+ static int
+-ufs_sync_cache(void)
++ufs_capacity(void)
+ {
+-	static const uint8_t cdb[10] = { 0x35 }; /* SYNCHRONIZE CACHE(10) */
+-	return ufs_scsi(cdb, sizeof(cdb), 0, false);
++	uint8_t cdb[16] = { 0x9e, 0x10 }; /* READ CAPACITY(16) */
++	cdb[13] = 32;
++	int error = ufs_scsi(cdb, sizeof(cdb), 32, false);
++	if (error) { return error; }
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	uint64_t last = mu_be64(b);
++	uint32_t block = mu_be32(b + 8);
++	if (last == UINT64_MAX || block < 512 || block > 4096 || (block & (block - 1)) ||
++	    last + 1 > UINT64_MAX / block) { return ENOTSUP; }
++	su.blocksize = block; su.total_blocks = last + 1;
++	printf("METROID UFS: LUN %u capacity=%llu blocks, blocksize=%u\n",
++	    su.lun, (unsigned long long)su.total_blocks, block);
++	return 0;
+ }
+ 
+ static int
+ ufs_find_partition(const char *want)
+ {
+-	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	uint8_t *b = (uint8_t *)(su.dma + DMA_BOUNCE);
+ 	int error = ufs_read_blocks(1, 1);
+-	if (error) {
+-		return error;
+-	}
+-	if (memcmp(b, "EFI PART", 8) != 0) {
+-		printf("SWEET UFS: LUN %u has no GPT\n", su.lun);
+-		return ENXIO;
+-	}
+-	uint64_t entry_lba;
+-	uint32_t nent, esz;
+-	memcpy(&entry_lba, b + 72, 8);
+-	memcpy(&nent, b + 80, 4);
+-	memcpy(&esz, b + 84, 4);
+-	if (esz != 128 || nent == 0 || nent > BOUNCE_SIZE / esz) {
+-		printf("SWEET UFS: unsupported GPT entries %u x %u\n", nent, esz);
+-		return ENXIO;
+-	}
+-	error = ufs_read_blocks(entry_lba, (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK);
+-	if (error) {
+-		return error;
+-	}
++	if (error) { return error; }
++	if (memcmp(b, "EFI PART", 8) || mu_le32(b + 8) != 0x00010000) { return ENOENT; }
++	uint32_t hsize = mu_le32(b + 12), hcrc = mu_le32(b + 16);
++	if (hsize < 92 || hsize > su.blocksize || mu_le64(b + 24) != 1 ||
++	    mu_le64(b + 32) >= su.total_blocks) { return EINVAL; }
++	memset(b + 16, 0, 4);
++	if (mu_crc32(b, hsize) != hcrc) { return EINVAL; }
++	uint64_t first_usable = mu_le64(b + 40), last_usable = mu_le64(b + 48);
++	uint64_t entry_lba = mu_le64(b + 72);
++	uint32_t nent = mu_le32(b + 80), esz = mu_le32(b + 84), ecrc = mu_le32(b + 88);
++	if (esz < 128 || (esz & 127) || esz > BOUNCE_SIZE || !nent || nent > BOUNCE_SIZE / esz ||
++	    first_usable > last_usable || last_usable >= su.total_blocks || entry_lba < 2) { return EINVAL; }
++	uint32_t bytes = nent * esz, blocks = (bytes + su.blocksize - 1) / su.blocksize;
++	if (entry_lba >= first_usable || blocks > first_usable - entry_lba) { return EINVAL; }
++	error = ufs_read_blocks(entry_lba, blocks);
++	if (error) { return error; }
++	if (mu_crc32(b, bytes) != ecrc) { return EINVAL; }
++	bool found = false;
+ 	for (uint32_t i = 0; i < nent; i++) {
+ 		const uint8_t *e = b + i * esz;
+-		char name[37];
+-		unsigned c;
+-		for (c = 0; c < 36; c++) {
+-			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
+-			if (ch == 0 || ch > 0x7f) {
+-				break;
+-			}
+-			name[c] = (char)ch;
+-		}
+-		name[c] = 0;
+-		if (strcmp(name, want) != 0) {
+-			continue;
++		uint8_t used = 0;
++		for (unsigned j = 0; j < 16; j++) { used |= e[j]; }
++		if (!used) { continue; }
++		char name[37]; unsigned j; bool ascii = true;
++		for (j = 0; j < 36; j++) {
++			uint16_t ch = (uint16_t)((uint16_t)e[56 + j * 2] | (uint16_t)e[57 + j * 2] << 8);
++			if (ch > 127) { ascii = false; break; }
++			if (!ch) { break; }
++			name[j] = (char)ch;
+ 		}
+-		uint64_t first, last;
+-		memcpy(&first, e + 32, 8);
+-		memcpy(&last, e + 40, 8);
+-		if (last < first) {
+-			return ENXIO;
+-		}
+-		su.first_block = first;
+-		su.nblocks = last - first + 1;
+-		return 0;
++		name[j] = 0;
++		if (!ascii || strcmp(name, want)) { continue; }
++		uint64_t first = mu_le64(e + 32), last = mu_le64(e + 40);
++		if (found || first < first_usable || last > last_usable || last < first) { return EINVAL; }
++		su.first_block = first; su.nblocks = last - first + 1; found = true;
+ 	}
+-	printf("SWEET UFS: no GPT partition named \"%s\"\n", want);
+-	return ENOENT;
++	return found ? 0 : ENOENT;
+ }
+-
+-static int
+-ufs_take_over_host(void)
+-{
+-	uint32_t hce = ufs_rd(REG_HCE), hcs = ufs_rd(REG_HCS);
+-	uint32_t cap = ufs_rd(REG_CAP);
+-	uint32_t memcfg = ufs_rd(REG_UFS_MEM_CFG);
+-	printf("METROID UFS: CAP=%08x VER=%08x HCE=%08x HCS=%08x IS=%08x IE=%08x MEMCFG=%08x\n",
+-	    cap, ufs_rd(REG_VER), hce, hcs, ufs_rd(REG_IS), ufs_rd(REG_IE), memcfg);
+-	/* Nothing Phone (3) exposes MCQ and an SMMU-managed endpoint. Never
+-	 * force a legacy request on an active MCQ controller. */
+-	if ((cap & UFS_CAP_LSDB_REMOVED) || (memcfg & UFS_MCQ_SELECTED)) {
+-		printf("METROID UFS: legacy single doorbell unavailable (CAP=%08x MEMCFG=%08x)\n",
+-		    cap, memcfg);
+-		return ENOTSUP;
+-	}
+-	if (su.dma_pa > UINT32_MAX && !(cap & UFS_CAP_64BIT_SUPPORTED)) {
+-		printf("METROID UFS: no 64-bit DMA capability for address 0x%llx\n",
+-		    (unsigned long long)su.dma_pa);
+-		return ENOTSUP;
+-	}
+-	printf("METROID UFS: legacy UTRLBA=%08x:%08x RSR=%08x DBR=%08x\n",
+-	    ufs_rd(REG_UTRLBAU), ufs_rd(REG_UTRLBA),
+-	    ufs_rd(REG_UTRLRSR), ufs_rd(REG_UTRLDBR));
+-	if (!(hce & 1) || !(hcs & HCS_DP) || !(hcs & HCS_UTRLRDY)) {
+-		printf("SWEET UFS: host not ready (hce 0x%x hcs 0x%x)\n", hce, hcs);
+-		return ENXIO;
+-	}
+-	if (ufs_rd(REG_UTRLDBR)) {
+-		printf("SWEET UFS: requests outstanding from the bootloader\n");
+-		return EBUSY;
+-	}
+-	ufs_wr(REG_IE, 0);                      /* polled operation */
+-	ufs_wr(REG_IS, ufs_rd(REG_IS));
+-	ufs_wr(REG_UTRLRSR, 0);
+-	uint64_t list = su.dma_pa + DMA_UTRL;
+-	ufs_wr(REG_UTRLBA, (uint32_t)list);
+-	ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
+-	ufs_wr(REG_UTRLRSR, 1);
+-	/* Never ring a doorbell unless the host uses our list. */
+-	if (ufs_rd(REG_UTRLBA) != (uint32_t)list || ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) ||
+-	    !(ufs_rd(REG_UTRLRSR) & 1)) {
+-		printf("SWEET UFS: host did not take our request list\n");
+-		return EIO;
+-	}
+-	return 0;
+-}
+-
+ static int
+ sweet_ufs_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
+ {
+@@ -477,12 +260,22 @@ sweet_ufs_strategy(buf_t bp)
+ 		goto done;
+ 	}
+ 
++	uint64_t lock_start = MU_NOW_US();
+ 	lck_mtx_lock(&sweet_ufs_lock);
++	uint64_t lock_us = MU_NOW_US() - lock_start;
++	su.host.lock_wait_us += lock_us;
++	if (lock_us > su.host.lock_max_us) { su.host.lock_max_us = lock_us; }
+ 	for (uint32_t done = 0; done < count;) {
+ 		uint64_t pos = off + done;
+ 		uint64_t lba = pos / UFS_BLOCK;
+ 		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
+ 		uint32_t want = MIN(count - done, BOUNCE_SIZE - skip);
++		/* Read-modify-write only the edge blocks. A large unaligned write
++		 * must not read its entire aligned interior back from the device. */
++		if (!rd) {
++			if (skip) { want = MIN(want, UFS_BLOCK - skip); }
++			else if (want >= UFS_BLOCK) { want -= want % UFS_BLOCK; }
++		}
+ 		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
+ 		char *bounce = (char *)(su.dma + DMA_BOUNCE);
+ 		if (rd) {
+@@ -524,6 +317,27 @@ sweet_ufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
+ 	uint64_t *o = (uint64_t *)data;
+ 
+ 	switch (cmd) {
++	case DKIOCISSOLIDSTATE:
++		*f = 1;
++		return 0;
++	case DKIOCGETFEATURES:
++		/* No FUA, barrier-only flush, or UNMAP until implemented end to end. */
++		*f = 0;
++		return 0;
++	case DKIOCGETMAXBYTECOUNTREAD:
++	case DKIOCGETMAXSEGMENTBYTECOUNTREAD:
++		*o = BOUNCE_SIZE;
++		return 0;
++	case DKIOCGETMAXBYTECOUNTWRITE:
++	case DKIOCGETMAXSEGMENTBYTECOUNTWRITE:
++		*o = su.writable && !su.io_failed ? BOUNCE_SIZE : 0;
++		return 0;
++	case DKIOCGETMINSEGMENTALIGNMENTBYTECOUNT:
++		*o = 1; /* buf_map + memcpy impose no physical segment alignment */
++		return 0;
++	case DKIOCGETCOMMANDPOOLSIZE:
++		*f = 1; /* one serialized UTP slot */
++		return 0;
+ 	case DKIOCGETBLOCKSIZE:
+ 		*f = su.secsize;
+ 		return 0;
+@@ -553,7 +367,11 @@ sweet_ufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
+ 		if (!su.writable) {
+ 			return 0;
+ 		}
++		uint64_t lock_start = MU_NOW_US();
+ 		lck_mtx_lock(&sweet_ufs_lock);
++		uint64_t lock_us = MU_NOW_US() - lock_start;
++		su.host.lock_wait_us += lock_us;
++		if (lock_us > su.host.lock_max_us) { su.host.lock_max_us = lock_us; }
+ 		int sync_error = ufs_sync_cache();
+ 		lck_mtx_unlock(&sweet_ufs_lock);
+ 		return sync_error;
+@@ -566,7 +384,9 @@ sweet_ufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
+ 		return 0;
+ 	case DKIOCGETMAXSEGMENTCOUNTREAD:
+ 	case DKIOCGETMAXSEGMENTCOUNTWRITE:
+-		*o = 1;
++		/* HFS bounds I/O by segment count * PAGE_SIZE. We bounce-copy
++		 * mapped buffers; physical pages need not be contiguous. */
++		*o = BOUNCE_SIZE / PAGE_SIZE;
+ 		return 0;
+ 	default:
+ 		return ENOTTY;
+@@ -639,113 +459,97 @@ sweet_ufs_init(void)
+ 	DTEntry node;
+ 	uintptr_t const *reg = NULL;
+ 	unsigned int size = 0;
+-	char want[64] = "userdata";
+-	int error;
+-
++	char want[64] = "userdata", write_partition[64] = { 0 };
++	uint32_t rw = 0, lun = 0;
+ 	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
+-	    size < 2 * sizeof(uintptr_t)) {
+-		printf("SWEET UFS: no /sweet-ufs node in the device tree\n");
+-		return ENXIO;
+-	}
+-	PE_parse_boot_argn("ufsroot", want, sizeof(want));
+-	want[sizeof(want) - 1] = '\0';
+-	uint32_t rw = 0;
+-	char write_partition[64] = { 0 };
++	    size != 2 * sizeof(uintptr_t) || reg[0] != 0x1d84000 || reg[1] != 0x3000) { return ENXIO; }
++	PE_parse_boot_argn("ufsroot", want, sizeof(want)); want[sizeof(want) - 1] = 0;
+ 	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
+ 	PE_parse_boot_argn("ufsrw_partition", write_partition, sizeof(write_partition));
+-	write_partition[sizeof(write_partition) - 1] = '\0';
+-	uint32_t cache = 0, wait = 0;
+-	PE_parse_boot_argn("ufscache", &cache, sizeof(cache));
+-	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));
+-	su.cache = (cache == 1);
+-	su.wait = (wait == 1);
+-	/* The Android DT gives UFS an SMMU stream. A plain PA is NOT normally
+-	 * a legal UFS DMA address. This opt-in is only for users who have
+-	 * independently verified that UFS uses identity-mapped DMA at handoff.
+-	 * Without that verification, stop before changing the UFS host. */
+-	int dma_identity_verified = 0;
+-	PE_parse_boot_argn("ufs_dma_identity", &dma_identity_verified,
+-	    sizeof(dma_identity_verified));
+-	if (dma_identity_verified != 1) {
+-		printf("METROID UFS: blocked unsafe DMA (verify SMMU and set ufs_dma_identity=1)\n");
+-		return ENOTSUP;
+-	}
+-
+-	if ((uint64_t)reg[0] != 0x01d84000ULL || reg[1] < 0x3000) {
+-		printf("METROID UFS: unexpected MMIO range 0x%llx length 0x%llx\n",
+-		    (unsigned long long)reg[0], (unsigned long long)reg[1]);
+-		return ENXIO;
+-	}
+-	su.regs = ml_io_map(reg[0], reg[1]);
+-	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+-	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		printf("SWEET UFS: no contiguous DMA memory\n");
+-		return ENOMEM;
+-	}
++	write_partition[sizeof(write_partition) - 1] = 0;
++	bool explicit_lun = PE_parse_boot_argn("ufslun", &lun, sizeof(lun));
++	if (!want[0] || strlen(want) > 36 || lun > 7) { return EINVAL; }
++	/* Existing write opt-in remains; no disk writes during init/discovery.
++	 * Actual device tests must start without ufsrw. userdata writes require
++	 * the separate destructive-step confirmation documented in AGENTS.md. */
++	bool owned_partition = !strncmp(want, "metroid_", 8) || !strncmp(want, "xnu_", 4) || !strcmp(want, "userdata");
++	if (rw && (rw != 1 || !owned_partition || strcmp(want, write_partition))) { return EPERM; }
++	su.host.regs = ml_io_map(reg[0], reg[1]);
++	su.host.smmu = ml_io_map(0x15000000, 0x100000);
++	if (!su.host.regs || !su.host.smmu) { return ENOMEM; }
++	{
++		su.host.phy = ml_io_map(0x1d80000, 0x2000);
++		su.host.gcc = ml_io_map(0x100000, 0xa0000);
++		/* Tuna pin191 is a dedicated UFS_RESET output, not GPIO stride191. */
++		su.host.reset = ml_io_map(0xf1ca000, 0x1000);
++		if (!su.host.phy || !su.host.gcc || !su.host.reset) { return ENOMEM; }
++	}
++	uint32_t busy = 0, hs = MU_DEFAULT_HS_GEAR, stats = 0;
++	PE_parse_boot_argn("ufsbusy", &busy, sizeof(busy));
++	PE_parse_boot_argn("ufshs", &hs, sizeof(hs));
++	PE_parse_boot_argn("ufsstats", &stats, sizeof(stats));
++	if (busy > 1 || hs > 3 || stats > 1) { return EINVAL; }
++	/* Include any inherited cache state in the first explicit sync. */
++	su.cache_dirty = true;
++	su.host.poll_only = busy != 0; su.host.target_gear = hs; su.host.stats = stats != 0;
++	printf("METROID UFS v5 (NOS031e8669): translated DMA; UFSHCI legacy transport; CAP=%08x VER=%08x\n",
++	    mu_r(&su.host, 0), mu_r(&su.host, 8));
++	printf("METROID UFS: completion=%s HS-gear-cap=%u stats=%u\n",
++	    busy ? "poll" : "spin/sleep", hs, stats);
++	mu_dump(&su.host, "init");
++	/* Check ownership and quiesce before any SMMU mutation. */
++	int error = mu_quiesce(&su.host);
++	if (error) { return error; }
++	const vm_size_t alloc_size = MU_POOL_SIZE + 0x4000;
++	if (kmem_alloc_contig(kernel_map, &su.dma, alloc_size, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) { return ENOMEM; }
+ 	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)su.dma);
+-	if (!pn) {
+-		return ENOMEM;
+-	}
+-	su.dma_pa = ptoa_64(pn);
+-	su.lun = 0;
+-	su.secsize = DEV_BSIZE;
+-
+-	lck_mtx_lock(&sweet_ufs_lock);
+-	error = ufs_take_over_host();
+-	if (!error) {
+-		static const uint8_t tur[6] = { 0x00 };
+-		/* The first command after the bootloader may report a unit attention. */
+-		for (int i = 0; i < 3; i++) {
++	if (!pn) { return ENOMEM; }
++	su.host.pool = (uint8_t *)su.dma; su.host.pool_pa = ptoa_64(pn);
++	/* Validate every CPU page; table pages are ordinary pinned RAM too. */
++	for (vm_size_t off = 0; off < alloc_size; off += PAGE_SIZE) {
++		ppnum_t page = pmap_find_phys(kernel_pmap, (addr64_t)(su.dma + off));
++		if (!page || ptoa_64(page) != su.host.pool_pa + off) { return EFAULT; }
++	}
++	su.host.tables = (uint64_t *)(su.dma + MU_POOL_SIZE);
++	su.host.tables_pa = su.host.pool_pa + MU_POOL_SIZE;
++	error = mu_map_dma(&su.host);
++	if (!error) { error = mu_start_host(&su.host); }
++	if (!error) { error = mu_device_init(&su.host); }
++	if (error) { printf("METROID UFS: initialization failed errno=%d\n", error); mu_dump(&su.host, "init-failed"); return error; }
++	printf("METROID UFS: device initialization complete\n");
++	/* Probe ordinary LUNs, or the explicitly selected ufslun. Only completed
++	 * UNIT ATTENTION/NOT READY is retried; DMA faults/timeouts stop probing. */
++	int found_error = ENOENT;
++	for (uint32_t candidate = explicit_lun ? lun : 0; candidate <= (explicit_lun ? lun : 7); candidate++) {
++		su.lun = (uint8_t)candidate;
++		const uint8_t tur[6] = { 0 };
++		for (unsigned retry = 0; retry < 10; retry++) {
+ 			error = ufs_scsi(tur, sizeof(tur), 0, false);
+-			if (!error || error == ETIMEDOUT)
+-				break;  /* never reuse a still-active UTRD after a timeout */
+-		}
+-	}
+-	if (!error) {
+-		error = ufs_find_partition(want);
+-	}
+-	lck_mtx_unlock(&sweet_ufs_lock);
+-	if (error) {
+-		return error;
+-	}
+-
+-	/* Writes require BOTH opt-ins and a clearly named non-Android
+-	 * dedicated partition. The GPT bounds are checked for every write.
+-	 * This is an experimental safety policy, not storage isolation. */
+-	if (rw != 0) {
+-		if (rw != 1 || !write_partition[0] ||
+-		    strcmp(write_partition, want) != 0 ||
+-		    (strncmp(want, "userdata", 8) != 0 &&
+-		    strncmp(want, "xnu_", 4) != 0) &&
+-           strcmp(want, "userdata") != 0) {
+-			printf("METROID UFS: write opt-in rejected; require ufsrw=1");
+-			return EPERM;
++			if (error != EAGAIN) { break; }
++			delay(10000);
+ 		}
+-		if (su.first_block < 2 || su.first_block > UINT32_MAX ||
+-		    !su.nblocks || su.nblocks - 1 > UINT32_MAX - su.first_block) {
+-			printf("METROID UFS: writable partition outside READ(10)/WRITE(10) range\n");
+-			return ENOTSUP;
+-		}
+-		su.writable = true;
+-	}
+-
++		if (!error) { error = ufs_capacity(); }
++		if (!error) { error = ufs_find_partition(want); }
++		if (!error) { found_error = 0; break; }
++		if (su.host.failed) { return error; }
++		if (explicit_lun) { return error; }
++		if (error != EIO && error != EAGAIN && error != ENOENT) { found_error = error; }
++	}
++	if (found_error) { return found_error; }
++	su.secsize = DEV_BSIZE;
+ 	su.bmajor = bdevsw_add(-1, &sweet_ufs_bdevsw);
+-	if (su.bmajor < 0) {
+-		return ENXIO;
+-	}
++	if (su.bmajor < 0) { return ENXIO; }
+ 	su.cmajor = cdevsw_add_with_bdev(-1, &sweet_ufs_cdevsw, su.bmajor);
+-	if (su.cmajor < 0) {
+-		return ENXIO;
+-	}
++	if (su.cmajor < 0) { return ENXIO; }
+ 	su.bdev = makedev(su.bmajor, 0);
+ 	devfs_make_node(su.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "ufsroot0");
+ 	devfs_make_node(makedev(su.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rufsroot0");
+-	su.ready = true;
+-	printf("METROID UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s\n",
+-	    want, su.lun, (unsigned long long)su.first_block,
+-	    (unsigned long long)(su.nblocks * UFS_BLOCK >> 20),
+-	    su.writable ? "EXPERIMENTAL READ-WRITE" : "read-only");
++	su.writable = rw == 1; su.ready = true;
++	printf("METROID UFS: root=%s LUN=%u first=%llu blocks=%llu blocksize=%u %s\n",
++	    want, su.lun, (unsigned long long)su.first_block, (unsigned long long)su.nblocks,
++	    su.blocksize, su.writable ? "EXPERIMENTAL READ-WRITE" : "read-only");
+ 	return 0;
+ }
+ 
+@@ -756,7 +560,10 @@ int
+ sweet_ufs_rootdev(dev_t *dev)
+ {
+ 	if (!su.ready) {
++		if (su.attempted) { return su.init_error; }
++		su.attempted = true;
+ 		int error = sweet_ufs_init();
++		su.init_error = error;
+ 		if (error) {
+ 			return error;
+ 		}
+diff --git a/bsd/dev/metroid_ufs.h b/bsd/dev/metroid_ufs.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/metroid_ufs.h
+@@ -0,0 +1,15 @@
++/* Metroid UFS v5. Nothing SM8735 kernel031e8669 is the platform/protocol
++ * reference. Caller provides serialized access, permanent contiguous memory,
++ * MMIO/cache/time hooks, and the firmware-supplied external power contract.
++ * Files are ordered by dependency; no global Linux reset/driver state is used.
++ */
++#ifndef METROID_UFS_H
++#define METROID_UFS_H
++#include "metroid_ufs_base.h"
++#include "metroid_ufs_smmu.h"
++#include "metroid_ufs_uic.h"
++#include "metroid_ufs_niobe.h"
++#include "metroid_ufs_qcom.h"
++#include "metroid_ufs_hci.h"
++#include "metroid_ufs_device.h"
++#endif
+diff --git a/bsd/dev/metroid_ufs_base.h b/bsd/dev/metroid_ufs_base.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/metroid_ufs_base.h
+@@ -0,0 +1,164 @@
++/* UFSHCI v4 legacy-queue definitions, DMA ownership and diagnostics. */
++#define MU_POOL_SIZE 0x104000u
++#define MU_DATA      0x4000u
++#define MU_UCD       0x1000u
++#define MU_TASK      0x0800u
++#define MU_BOUNCE    0x100000u
++#define MU_TABLE_SIZE 0x3000u
++#define MU_IOVA      0x40000000ull
++#define MU_SID       0x60u
++#define MU_ADDR_MASK 0x0000fffffffff000ull
++#define MU_DEFAULT_HS_GEAR 3u /* capability-capped; ufshs=0 retains PWM */
++#define MU_TIMEOUT_US 5000000u
++#define MU_DEVICE_WLUN 0xd0u
++#define MU_DEVICE_ACTIVE_TIMEOUT_US 10000000u /* Nothing START STOP: 10 * HZ */
++#define MU_QUERY_ATTEMPTS 3u /* Nothing ufshcd.c QUERY_REQ_RETRIES */
++#define MU_UIC_DONE (1u << 10)
++#define MU_HIBERN8_EXIT_DONE (1u << 5)
++#define MU_TX_FSM_ATTRIBUTE (0x41u << 16) /* QCOM MPHY_TX_FSM_STATE, lane 0 */
++#define MU_TX_FSM_HIBERN8 1u
++#define MU_QCOM_CFG1 0xdcu
++#define MU_QCOM_HW_VERSION 0xe4u
++#define MU_QCOM_REF_CLK (1u << 26)
++#define MU_QCOM_NO_ICE_CHECK (1u << 31)
++/* Nothing arm-smmu.h ARM_SMMU_FSR_FAULT: MULTI, SS and bits 8:1.
++ * Bit 10 (0x400) is not a recognized context fault. Do not infer a valid
++ * fault address from FAR unless an actual fault bit is set.
++ */
++#define MU_SMMU_FSR_FAULT 0xc00001feu
++#define MU_FATAL_IS ((1u << 2) | (1u << 7) | (1u << 11) | (1u << 16) | (1u << 17) | (1u << 18))
++
++struct mu_utrd {
++	uint32_t header, reserved, ocs, reserved2;
++	uint32_t ucd_lo, ucd_hi;
++	uint16_t response_len, response_offset, prdt_len, prdt_offset;
++};
++struct mu_ucd {
++	uint8_t request[512], response[512];
++	struct { uint32_t lo, hi, reserved, bytes; } prdt[4];
++};
++_Static_assert(sizeof(struct mu_utrd) == 32, "UFSHCI UTRD size");
++_Static_assert(offsetof(struct mu_ucd, response) == 512, "response offset");
++_Static_assert(offsetof(struct mu_ucd, prdt) == 1024, "PRDT offset");
++
++enum mu_io_kind { MU_IO_READ, MU_IO_WRITE, MU_IO_SYNC, MU_IO_OTHER, MU_IO_KINDS };
++struct mu_io_stats { uint64_t calls, errors, bytes, us, max_us; };
++
++enum mu_state { MU_OFF, MU_DMA_READY, MU_LINK_READY, MU_DEVICE_READY, MU_IO_FAILED };
++struct mu_host {
++	uintptr_t regs, smmu, phy, gcc, reset;
++	uint8_t *pool;
++	uint64_t pool_pa, tables_pa;
++	uint64_t *tables;
++	uint32_t pgshift, cb_base, gr1, ncb, ns2cb, nsmr, cb, smr, asid, ips;
++	uint32_t old_smr, old_s2cr;
++	uint32_t tx_fsm;
++	const char *phase;
++	uint32_t core_mhz, unipro_mhz, phy_gear, uic_result, link_errors[5];
++	uint16_t device_spec, manufacturer;
++	uint32_t target_gear;
++	uint64_t commands, read_bytes, write_bytes, service_us, max_us, sleeps;
++	uint64_t scsi_calls, slow_calls, lock_wait_us, lock_max_us;
++	struct mu_io_stats io[MU_IO_KINDS];
++	enum mu_state state;
++	bool mapped, failed, configured, poll_only, stats;
++};
++
++static void mu_fail(struct mu_host *h) { h->failed = true; h->state = MU_IO_FAILED; }
++
++static uint32_t mu_r(struct mu_host *h, uint32_t off) { return MU_READ32(h->regs + off); }
++static void mu_w(struct mu_host *h, uint32_t off, uint32_t v) { MU_WRITE32(h->regs + off, v); MU_BARRIER(); }
++static uint32_t mu_sr(struct mu_host *h, uint32_t off) { return MU_READ32(h->smmu + off); }
++static void mu_sw(struct mu_host *h, uint32_t off, uint32_t v) { MU_WRITE32(h->smmu + off, v); MU_BARRIER(); }
++static uint32_t mu_cb(struct mu_host *h, uint32_t cb) { return h->cb_base + (cb << h->pgshift); }
++static uint64_t mu_sr64(struct mu_host *h, uint32_t off) { return (uint64_t)mu_sr(h, off) | (uint64_t)mu_sr(h, off + 4) << 32; }
++/* Aligned 64-bit device accesses, as used for AArch64 TTBRs in Linux. */
++static void mu_sw64(struct mu_host *h, uint32_t off, uint64_t v) { MU_WRITE64(h->smmu + off, v); MU_BARRIER(); }
++
++static int
++mu_poll(struct mu_host *h, bool smmu, uint32_t off, uint32_t mask,
++    uint32_t want, uint32_t timeout)
++{
++	uint64_t start = MU_NOW_US();
++	do {
++		uint32_t v = smmu ? mu_sr(h, off) : mu_r(h, off);
++		if ((v & mask) == want) { return 0; }
++		MU_DELAY(10);
++	} while (MU_NOW_US() - start < timeout);
++	return ETIMEDOUT;
++}
++
++static void
++mu_dump(struct mu_host *h, const char *stage)
++{
++	MU_LOG("METROID UFS[%s]: IS=%08x HCS=%08x HCE=%08x DBR=%08x RSR=%08x MEMCFG=%08x UTRL=%08x:%08x\n",
++	    stage, mu_r(h, 0x20), mu_r(h, 0x30), mu_r(h, 0x34), mu_r(h, 0x58),
++	    mu_r(h, 0x60), mu_r(h, 0x300), mu_r(h, 0x54), mu_r(h, 0x50));
++	MU_LOG("METROID UFS[%s]: phase=%s AHIT=%08x QCOM_VER=%08x CFG1=%08x TX_FSM=%x\n",
++	    stage, h->phase ? h->phase : "idle", mu_r(h, 0x18),
++	    mu_r(h, MU_QCOM_HW_VERSION), mu_r(h, MU_QCOM_CFG1), h->tx_fsm);
++	if (h->mapped && h->pool) {
++		/* Descriptors were cleaned before submission; no CPU writes occur
++		 * while DMA owns them. Refresh cache lines for diagnostic reads only.
++		 * OCS=invalid with DBR=1 alone does not prove the request was unfetched.
++		 */
++		MU_FLUSH((uintptr_t)h->pool, sizeof(struct mu_utrd));
++		MU_FLUSH((uintptr_t)h->pool + MU_UCD + offsetof(struct mu_ucd, response), 32);
++		MU_BARRIER();
++		const volatile struct mu_utrd *d = (const volatile struct mu_utrd *)h->pool;
++		const volatile struct mu_ucd *c = (const volatile struct mu_ucd *)(h->pool + MU_UCD);
++		MU_LOG("METROID UFS[%s]: request=%02x cdb=%02x tag=%02x UTRD_OCS=%08x header=%08x UCD=%08x:%08x\n",
++		    stage, c->request[0], c->request[16], c->request[3], d->ocs, d->header, d->ucd_hi, d->ucd_lo);
++		MU_LOG("METROID UFS[%s]: response=%02x flags=%02x lun=%02x tag=%02x result=%02x status=%02x resp_off=%u resp_len=%u prdt_len=%u\n",
++		    stage, c->response[0], c->response[1], c->response[2], c->response[3], c->response[6], c->response[7],
++		    d->response_offset, d->response_len, d->prdt_len);
++	}
++	MU_LOG("METROID SMMU[%s]: sCR0=%08x sACR=%08x GFSR=%08x GFSYNR1=%08x\n",
++	    stage, mu_sr(h, 0), mu_sr(h, 0x10), mu_sr(h, 0x48), mu_sr(h, 0x54));
++	MU_LOG("METROID UFS[%s]: UECPA=%08x UECDL=%08x UECN=%08x UECT=%08x UECDME=%08x\n",
++	    stage, mu_r(h, 0x38), mu_r(h, 0x3c), mu_r(h, 0x40), mu_r(h, 0x44), mu_r(h, 0x48));
++	if (h->configured) {
++		uint32_t b = mu_cb(h, h->cb);
++		MU_LOG("METROID SMMU[%s]: SID=60 SMR[%u]=%08x S2CR=%08x CB=%u SCTLR=%08x FSR=%08x FAR=%08x:%08x FSYNR0=%08x\n",
++		    stage, h->smr, mu_sr(h, 0x800 + 4 * h->smr), mu_sr(h, 0xc00 + 4 * h->smr),
++		    h->cb, mu_sr(h, b), mu_sr(h, b + 0x58), mu_sr(h, b + 0x64), mu_sr(h, b + 0x60), mu_sr(h, b + 0x68));
++		MU_LOG("METROID SMMU[%s]: fault_bits=%08x fault_SID=%04x (FAR meaningful only with fault_bits)\n",
++		    stage, mu_sr(h, b + 0x58) & MU_SMMU_FSR_FAULT,
++		    mu_sr(h, h->gr1 + 0x400 + 4 * h->cb) & 0xffff);
++		MU_LOG("METROID SMMU[%s]: CBAR=%08x CBA2R=%08x TCR=%08x TCR2=%08x TTBR0=%08x:%08x MAIR=%08x:%08x\n",
++		    stage, mu_sr(h, h->gr1 + 4 * h->cb), mu_sr(h, h->gr1 + 0x800 + 4 * h->cb),
++		    mu_sr(h, b + 0x30), mu_sr(h, b + 0x10), mu_sr(h, b + 0x24), mu_sr(h, b + 0x20),
++		    mu_sr(h, b + 0x3c), mu_sr(h, b + 0x38));
++	}
++}
++
++/* Stop both legacy engines before replacing any descriptor or DMA mappings.
++ * An already-selected MCQ controller requires a separate queue teardown and
++ * is refused before writes, not switched to legacy behind firmware's back. */
++static int
++mu_quiesce(struct mu_host *h)
++{
++	if (mu_r(h, 8) < 0x00000200) { return ENOTSUP; }
++	if ((mu_r(h, 0) & (1u << 29)) || (mu_r(h, 0x300) & 1)) {
++		MU_LOG("METROID UFS: MCQ active or legacy removed; MCQ teardown is not implemented\n");
++		return ENOTSUP;
++	}
++	if (!(mu_r(h, 0x34) & 1) && !h->phy) {
++		MU_LOG("METROID UFS: firmware PHY/host is off; cold PHY/clock bring-up required\n");
++		return ENXIO;
++	}
++	if (mu_r(h, 0x58) || mu_r(h, 0x78)) { return EBUSY; }
++	/* Freeze automatic link sleep before changing the DMA domain. Existing
++	 * manual Hibern8 is handled explicitly before enabling request lists. */
++	mu_w(h, 0x18, 0);
++	if (mu_r(h, 0x18) & 0x1fff) {
++		MU_LOG("METROID UFS: cannot disable automatic Hibern8\n");
++		return EIO;
++	}
++	mu_w(h, 0x24, 0);
++	mu_w(h, 0x60, 0);
++	mu_w(h, 0x80, 0);
++	if (mu_poll(h, false, 0x60, 1, 0, 10000) || mu_poll(h, false, 0x80, 1, 0, 10000)) { return ETIMEDOUT; }
++	if (mu_r(h, 0x58) || mu_r(h, 0x78)) { return EBUSY; }
++	return 0;
++}
+diff --git a/bsd/dev/metroid_ufs_device.h b/bsd/dev/metroid_ufs_device.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/metroid_ufs_device.h
+@@ -0,0 +1,108 @@
++/* UFS device management: standard query UPIUs (Nothing ufshcd query helpers).
++ * Query results are always checked, including GENERAL_FAILURE. This deliberately
++ * does not copy the reference completion helper's nonzero-result success bug.
++ */
++static uint32_t mu_upiu_word(const uint8_t *p)
++{
++	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
++}
++static void mu_query_dump(const char *which, const uint8_t *p)
++{
++	MU_LOG("METROID UFS: query-%s %08x %08x %08x %08x %08x %08x %08x %08x\n", which,
++	    mu_upiu_word(p), mu_upiu_word(p + 4), mu_upiu_word(p + 8), mu_upiu_word(p + 12),
++	    mu_upiu_word(p + 16), mu_upiu_word(p + 20), mu_upiu_word(p + 24), mu_upiu_word(p + 28));
++}
++static int
++mu_query(struct mu_host *h, uint8_t opcode, uint8_t idn, uint16_t allocation, uint16_t *received)
++{
++	if (h->failed || allocation > 255) { return EIO; }
++	for (unsigned attempt = 1; attempt <= 3; attempt++) {
++		int error = mu_prepare(h, 0x16, 0);
++		if (error) { return error; }
++		struct mu_ucd *c = (struct mu_ucd *)(h->pool + MU_UCD);
++		c->request[5] = opcode == 6 ? 0x81 : 1;
++		c->request[12] = opcode; c->request[13] = idn;
++		c->request[18] = (uint8_t)(allocation >> 8); c->request[19] = (uint8_t)allocation;
++		error = mu_submit(h, 0, false, 0x36);
++		if (error) { return error; }
++		uint8_t result = c->response[6];
++		uint16_t segment = (uint16_t)((uint32_t)c->response[10] << 8 | c->response[11]);
++		uint16_t length = (uint16_t)((uint32_t)c->response[18] << 8 | c->response[19]);
++		if (!result && !c->response[7] && c->response[5] == c->request[5] && !memcmp(c->request + 12, c->response + 12, 4) &&
++		    ((!allocation && !segment && !length) ||
++		    (allocation && length <= allocation && segment == length))) {
++			if (received) { *received = length; }
++			return 0;
++		}
++		MU_LOG("METROID UFS: %s attempt=%u/3 opcode=%02x result=%02x status=%02x\n",
++		    h->phase, attempt, opcode, result, c->response[7]);
++		mu_query_dump("req", c->request); mu_query_dump("rsp", c->response);
++		if (result != 0xff || c->response[7] || attempt == 3) { return EIO; }
++		MU_DELAY(1000);
++	}
++	return EIO;
++}
++static int
++mu_query_flag(struct mu_host *h, bool set, uint8_t *value)
++{
++	h->phase = set ? "fDeviceInit-set" : "fDeviceInit-read";
++	int error = mu_query(h, set ? 6 : 5, 1, 0, NULL);
++	if (!error) { *value = ((struct mu_ucd *)(h->pool + MU_UCD))->response[23] & 1; }
++	return error;
++}
++static int
++mu_wait_device_init(struct mu_host *h)
++{
++	uint64_t start = MU_NOW_US();
++	do {
++		uint8_t flag = 1;
++		int error = mu_query_flag(h, false, &flag);
++		if (error || !flag) { return error; }
++		MU_DELAY(1000);
++	} while (MU_NOW_US() - start < MU_TIMEOUT_US);
++	return ETIMEDOUT;
++}
++static int
++mu_device_descriptor(struct mu_host *h)
++{
++	h->phase = "device-descriptor";
++	uint16_t length = 0;
++	int error = mu_query(h, 1, 0, 255, &length); /* READ_DESC, device IDN0 */
++	if (error) { return error; }
++	const uint8_t *d = ((struct mu_ucd *)(h->pool + MU_UCD))->response + 32;
++	if (length < 0x1a || d[0] < 0x1a || d[0] > length || d[1] != 0) { return EIO; }
++	h->device_spec = (uint16_t)((uint32_t)d[0x10] << 8 | d[0x11]);
++	h->manufacturer = (uint16_t)((uint32_t)d[0x18] << 8 | d[0x19]);
++	if (h->device_spec < 0x0200 || h->device_spec > 0x0400) { return ENOTSUP; }
++	MU_LOG("METROID UFS: device spec=%04x manufacturer=%04x LUs=%u\n", h->device_spec, h->manufacturer, d[6]);
++	return 0;
++}
++static int
++mu_activate_device(struct mu_host *h)
++{
++	const uint8_t active[6] = { 0x1b, 0, 0, 0, 0x10, 0 };
++	for (unsigned attempt = 1; attempt <= 3; attempt++) {
++		int error = mu_scsi(h, MU_DEVICE_WLUN, active, sizeof(active), 0, false);
++		MU_LOG("METROID UFS: device ACTIVE attempt=%u/3 errno=%d\n", attempt, error);
++		if (!error || h->failed || error != EAGAIN || attempt == 3) { return error; }
++		MU_DELAY(10000);
++	}
++	return EIO;
++}
++static int
++mu_device_init(struct mu_host *h)
++{
++	if (h->failed || h->state != MU_LINK_READY) { return EIO; }
++	h->phase = "nop";
++	int error = mu_prepare(h, 0, 0);
++	if (!error) { error = mu_submit(h, 0, false, 0x20); }
++	if (error) { return error; }
++	uint8_t flag = 1;
++	error = mu_query_flag(h, true, &flag);
++	if (!error) { error = mu_wait_device_init(h); }
++	if (!error) { error = mu_device_descriptor(h); }
++	if (!error) { error = mu_activate_device(h); }
++	if (!error && h->target_gear) { error = mu_hs_mode(h, h->target_gear); }
++	if (!error) { h->state = MU_DEVICE_READY; }
++	return error;
++}
+diff --git a/bsd/dev/metroid_ufs_hci.h b/bsd/dev/metroid_ufs_hci.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/metroid_ufs_hci.h
+@@ -0,0 +1,177 @@
++/* Serialized legacy UTP queue with explicit DMA/cache ownership.
++ * v4 supports this transport when CAP.LSDBRemoved=0; MCQ is not required. */
++/* No timeout retries: a late DMA must never land in a reused command buffer. */
++static int
++mu_submit(struct mu_host *h, uint32_t len, bool write, uint8_t response_type)
++{
++	if (len > MU_BOUNCE) { return EINVAL; }
++	if (!h->mapped || h->state < MU_LINK_READY || h->failed || mu_r(h, 0x58) || !(mu_r(h, 0x60) & 1)) { return EIO; }
++	uint64_t service_start = MU_NOW_US();
++	struct mu_utrd *d = (struct mu_utrd *)h->pool;
++	struct mu_ucd *c = (struct mu_ucd *)(h->pool + MU_UCD);
++	/* Detect a lost/changed stream or list base before publishing a request. */
++	if (mu_sr(h, 0x800 + 4 * h->smr) != ((1u << 31) | MU_SID) ||
++	    (mu_sr(h, 0xc00 + 4 * h->smr) & ((3u << 16) | 0xff)) != h->cb ||
++	    !(mu_sr(h, mu_cb(h, h->cb)) & 1) ||
++	    mu_r(h, 0x50) != MU_IOVA || mu_r(h, 0x54)) {
++		mu_fail(h); mu_dump(h, "dma-route-changed"); return EIO;
++	}
++	d->header = (1u << 28) | (1u << 24) | (len ? (write ? 1u : 2u) << 25 : 0);
++	d->ocs = 0xf;
++	d->ucd_lo = (uint32_t)(MU_IOVA + MU_UCD); d->ucd_hi = 0;
++	d->response_len = 512 / 4; d->response_offset = 512 / 4;
++	d->prdt_len = (uint16_t)((len + 0x3ffff) / 0x40000); d->prdt_offset = 1024 / 4;
++	for (uint32_t i = 0, done = 0; i < d->prdt_len; i++) {
++		uint32_t chunk = len - done > 0x40000 ? 0x40000 : len - done;
++		c->prdt[i].lo = (uint32_t)(MU_IOVA + MU_DATA + done);
++		c->prdt[i].hi = 0; c->prdt[i].bytes = chunk - 1;
++		done += chunk;
++	}
++	/* Transfer cache ownership, including previously cached response/OCS
++	 * lines, before doorbell. CPU never writes these while DMA owns them. */
++	MU_FLUSH((uintptr_t)d, sizeof(*d));
++	MU_FLUSH((uintptr_t)c, sizeof(*c));
++	if (len) {
++		if (write) { MU_CLEAN((uintptr_t)h->pool + MU_DATA, len); }
++		else { MU_FLUSH((uintptr_t)h->pool + MU_DATA, len); }
++	}
++	MU_BARRIER();
++	mu_w(h, 0x58, 1);
++	/* Device power transitions have Linux's separate ten-second deadline. */
++	uint32_t timeout = response_type == 0x21 && c->request[2] == MU_DEVICE_WLUN &&
++	    c->request[16] == 0x1b ? MU_DEVICE_ACTIVE_TIMEOUT_US : MU_TIMEOUT_US;
++	uint64_t start = MU_NOW_US();
++	while (mu_r(h, 0x58) & 1) {
++		uint32_t is = mu_r(h, 0x20);
++		uint32_t fault = mu_sr(h, mu_cb(h, h->cb) + 0x58) & MU_SMMU_FSR_FAULT;
++		uint64_t elapsed = MU_NOW_US() - start;
++		if ((is & MU_FATAL_IS) || fault || elapsed >= timeout) {
++			mu_fail(h);
++			mu_dump(h, "timeout/fault");
++			return ((is & MU_FATAL_IS) || fault) ? EIO : ETIMEDOUT;
++		}
++		/* Fast completions stay on-CPU for 50us. Long transfers release
++		 * this CPU with 200us..1ms polling backoff. Slot ownership
++		 * and the original command deadline survive every sleep. */
++		uint32_t pause = timeout - (uint32_t)elapsed;
++		uint32_t interval = elapsed < 1000 ? 200 : elapsed < 5000 ? 500 : 1000;
++		if (pause > interval) { pause = interval; }
++		if (elapsed >= 50 && !h->poll_only && MU_WAIT_US(pause)) { h->sleeps++; }
++		else { MU_DELAY(elapsed < 50 ? 1 : (pause < 10 ? pause : 10)); }
++	}
++	MU_BARRIER();
++	MU_FLUSH((uintptr_t)d, sizeof(*d));
++	MU_FLUSH((uintptr_t)c->response, sizeof(c->response));
++	if (len && !write) { MU_FLUSH((uintptr_t)h->pool + MU_DATA, len); }
++	if ((mu_r(h, 0x20) & MU_FATAL_IS) ||
++	    (mu_sr(h, mu_cb(h, h->cb) + 0x58) & MU_SMMU_FSR_FAULT)) {
++		mu_fail(h); mu_dump(h, "completion-fault"); return EIO;
++	}
++	mu_w(h, 0x20, 1); /* acknowledge transfer completion only */
++	if ((d->ocs & 0xff) || c->response[8] || c->response[0] != response_type ||
++	    c->response[2] != c->request[2] || c->response[3] != c->request[3]) {
++		MU_LOG("METROID UFS: malformed completion OCS=%x response=%x tag=%x/%x\n",
++		    d->ocs, c->response[0], c->response[3], c->request[3]);
++		mu_fail(h); return EIO;
++	}
++	h->commands++;
++	if (write) { h->write_bytes += len; } else { h->read_bytes += len; }
++	uint64_t service = MU_NOW_US() - service_start;
++	h->service_us += service;
++	if (service > h->max_us) { h->max_us = service; }
++
++	return 0;
++}
++
++static int
++mu_prepare(struct mu_host *h, uint8_t type, uint8_t lun)
++{
++	if (!h->mapped || h->failed || h->state < MU_LINK_READY) { return EIO; }
++	if (mu_r(h, 0x58)) { mu_fail(h); return EBUSY; }
++	memset(h->pool, 0, sizeof(struct mu_utrd));
++	struct mu_ucd *c = (struct mu_ucd *)(h->pool + MU_UCD);
++	memset(c, 0, sizeof(*c));
++	c->request[0] = type; c->request[2] = lun; c->request[3] = 0; /* slot 0 */
++	return 0;
++}
++
++static int
++mu_scsi_exec(struct mu_host *h, uint8_t lun, const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
++{
++	if (h->failed) { return EIO; }
++	if (!cdb || cdb_len > 16 || !cdb_len || len > MU_BOUNCE) { return EINVAL; }
++	h->phase = lun == MU_DEVICE_WLUN && cdb[0] == 0x1b ? "device-active" : "scsi";
++	int error = mu_prepare(h, 1, lun);
++	if (error) { return error; }
++	struct mu_ucd *c = (struct mu_ucd *)(h->pool + MU_UCD);
++	c->request[1] = len ? (write ? 0x20 : 0x40) : 0;
++	c->request[12] = (uint8_t)(len >> 24); c->request[13] = (uint8_t)(len >> 16);
++	c->request[14] = (uint8_t)(len >> 8); c->request[15] = (uint8_t)len;
++	memcpy(c->request + 16, cdb, cdb_len);
++	error = mu_submit(h, len, write, 0x21);
++	if (error) { return error; }
++	if (c->response[6] || c->response[7]) {
++		const uint8_t *sense = c->response + 34;
++		uint32_t sense_len = (uint32_t)c->response[32] << 8 | c->response[33];
++		uint32_t data_len = (uint32_t)c->response[10] << 8 | c->response[11];
++		uint8_t key = 0xff, asc = 0, ascq = 0;
++		if (sense_len >= 14 && sense_len <= 18 && data_len >= sense_len + 2 &&
++		    ((sense[0] & 0x7f) == 0x70 || (sense[0] & 0x7f) == 0x71)) {
++			key = sense[2] & 0xf; asc = sense[12]; ascq = sense[13];
++		} else if (sense_len >= 4 && sense_len <= 18 && data_len >= sense_len + 2 &&
++		    ((sense[0] & 0x7f) == 0x72 || (sense[0] & 0x7f) == 0x73)) {
++			key = sense[1] & 0xf; asc = sense[2]; ascq = sense[3];
++		}
++		MU_LOG("METROID UFS: SCSI cmd=%02x LUN=%02x response=%02x status=%02x sense=%02x/%02x/%02x\n",
++		    cdb[0], lun, c->response[6], c->response[7], key, asc, ascq);
++		/* Retry completed sense conditions, never a transport failure.
++		 * Some devices report target failure (response=1) with the reset
++		 * UNIT ATTENTION after our reset. Consume that notification with
++		 * a bounded retry; it is not successful device activation. */
++		bool reset_attention = c->response[6] == 1 && key == 6 && asc == 0x29 && ascq == 2;
++		return c->response[7] == 2 &&
++		    ((!c->response[6] && (key == 6 || key == 2)) || reset_attention) ? EAGAIN : EIO;
++	}
++	/* Refuse short/overflowed reads; stale bounce bytes must not reach BSD. */
++	if (c->response[1] & 0x60) { return EIO; }
++	return 0;
++}
++
++/* Record SCSI outcomes after status/residual validation, separately from
++ * transport completions. Slow writes and zero-byte syncs must be distinguishable. */
++static int
++mu_scsi(struct mu_host *h, uint8_t lun, const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
++{
++	uint64_t start = MU_NOW_US();
++	int error = mu_scsi_exec(h, lun, cdb, cdb_len, len, write);
++	uint8_t op = cdb && cdb_len ? cdb[0] : 0xff;
++	unsigned kind = op == 0x88 ? MU_IO_READ : op == 0x8a ? MU_IO_WRITE :
++	    op == 0x91 ? MU_IO_SYNC : MU_IO_OTHER;
++	struct mu_io_stats *io = &h->io[kind];
++	uint64_t us = MU_NOW_US() - start;
++	io->calls++; io->errors += error != 0; io->us += us;
++	if (!error) { io->bytes += len; }
++	if (us > io->max_us) { io->max_us = us; }
++	h->scsi_calls++;
++	if (h->stats && us >= 100000) {
++		h->slow_calls++;
++		/* Bound framebuffer logging even when every request is slow. */
++		if (h->slow_calls <= 4 || !(h->slow_calls & (h->slow_calls - 1))) {
++			MU_LOG("METROID UFS slow: cdb=%02x bytes=%u us=%llu error=%d slow-count=%llu\n",
++			    op, len, (unsigned long long)us, error, (unsigned long long)h->slow_calls);
++		}
++	}
++	if (h->stats && !(h->scsi_calls % 1024)) {
++		MU_LOG("METROID UFS stats: lock-wait-us=%llu lock-max-us=%llu sleeps=%llu\n",
++		    (unsigned long long)h->lock_wait_us, (unsigned long long)h->lock_max_us,
++		    (unsigned long long)h->sleeps);
++		for (unsigned i = 0; i < MU_IO_KINDS; i++) {
++			const struct mu_io_stats *v = &h->io[i];
++			MU_LOG("METROID UFS stats %s: calls=%llu errors=%llu ok-bytes=%llu service-us=%llu max-us=%llu\n",
++			    i == MU_IO_READ ? "read" : i == MU_IO_WRITE ? "write" : i == MU_IO_SYNC ? "sync" : "other",
++			    (unsigned long long)v->calls, (unsigned long long)v->errors,
++			    (unsigned long long)v->bytes, (unsigned long long)v->us, (unsigned long long)v->max_us);
++		}
++	}
++	return error;
++}
+diff --git a/bsd/dev/metroid_ufs_niobe.h b/bsd/dev/metroid_ufs_niobe.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/metroid_ufs_niobe.h
+@@ -0,0 +1,126 @@
++/* Niobe calibration register values: Nothing SM8735 kernel 031e8669,
++ * phy-qcom-ufs-qmp-v4-niobe.h (Qualcomm 2024, GPL-2.0-only).
++ * Ordered Rate A base, optional G4 limits, second lane, then Rate B overrides.
++ */
++struct mu_phy_setting { uint16_t off; uint8_t value; };
++static const struct mu_phy_setting mu_phy_rate_A_g5[] = {
++	{ 0x0404, 0x01 },
++	{ 0x0110, 0xd9 },
++	{ 0x0174, 0x16 },
++	{ 0x003c, 0x11 },
++	{ 0x009c, 0x00 },
++	{ 0x0120, 0x01 },
++	{ 0x00f4, 0x1f },
++	{ 0x00f8, 0x1f },
++	{ 0x00fc, 0x0a },
++	{ 0x0100, 0x17 },
++	{ 0x0140, 0x04 },
++	{ 0x0148, 0x00 },
++	{ 0x0088, 0x41 },
++	{ 0x0070, 0x06 },
++	{ 0x0074, 0x18 },
++	{ 0x0078, 0x14 },
++	{ 0x0080, 0x7f },
++	{ 0x0084, 0x06 },
++	{ 0x0028, 0x4c },
++	{ 0x0010, 0x06 },
++	{ 0x0014, 0x18 },
++	{ 0x0018, 0x14 },
++	{ 0x0020, 0x99 },
++	{ 0x0024, 0x07 },
++	{ 0x107c, 0x01 },
++	{ 0x1030, 0x07 },
++	{ 0x1034, 0x0e },
++	{ 0x12d4, 0x0c },
++	{ 0x12dc, 0x0c },
++	{ 0x12f0, 0x04 },
++	{ 0x13bc, 0x14 },
++	{ 0x12f4, 0x07 },
++	{ 0x13c4, 0x0e },
++	{ 0x1254, 0x02 },
++	{ 0x1210, 0x1c },
++	{ 0x1224, 0x06 },
++	{ 0x1378, 0x8e },
++	{ 0x13ac, 0x0f },
++	{ 0x1408, 0xce },
++	{ 0x140c, 0xce },
++	{ 0x1410, 0x18 },
++	{ 0x1414, 0x1a },
++	{ 0x1418, 0x0f },
++	{ 0x1420, 0x60 },
++	{ 0x1438, 0x9e },
++	{ 0x1444, 0x60 },
++	{ 0x145c, 0x9e },
++	{ 0x1460, 0x0e },
++	{ 0x1464, 0x36 },
++	{ 0x1470, 0x02 },
++	{ 0x1474, 0x1b },
++	{ 0x1478, 0x1b },
++	{ 0x147c, 0x20 },
++	{ 0x1480, 0xb9 },
++	{ 0x1484, 0x5d },
++	{ 0x1228, 0x1f },
++	{ 0x1258, 0x94 },
++	{ 0x12c4, 0xfa },
++	{ 0x14f8, 0x30 },
++	{ 0x187c, 0x01 },
++	{ 0x1830, 0x07 },
++	{ 0x1834, 0x0e },
++	{ 0x1ad4, 0x0c },
++	{ 0x1adc, 0x0c },
++	{ 0x1af0, 0x04 },
++	{ 0x1bbc, 0x14 },
++	{ 0x1af4, 0x07 },
++	{ 0x1bc4, 0x0e },
++	{ 0x1a54, 0x02 },
++	{ 0x1a10, 0x1c },
++	{ 0x1a24, 0x06 },
++	{ 0x1b78, 0x8e },
++	{ 0x1bac, 0x0f },
++	{ 0x1c08, 0xce },
++	{ 0x1c0c, 0xce },
++	{ 0x1c10, 0x18 },
++	{ 0x1c14, 0x1a },
++	{ 0x1c18, 0x0f },
++	{ 0x1c20, 0x60 },
++	{ 0x1c38, 0x9e },
++	{ 0x1c44, 0x60 },
++	{ 0x1c5c, 0x9e },
++	{ 0x1c60, 0x0e },
++	{ 0x1c64, 0x36 },
++	{ 0x1c70, 0x02 },
++	{ 0x1c74, 0x1b },
++	{ 0x1c78, 0x1b },
++	{ 0x1c7c, 0x20 },
++	{ 0x1c80, 0xb9 },
++	{ 0x1c84, 0x5d },
++	{ 0x1a28, 0x1f },
++	{ 0x1a58, 0x94 },
++	{ 0x1ac4, 0xfa },
++	{ 0x1cf8, 0x30 },
++	{ 0x05fc, 0x00 },
++	{ 0x05f4, 0x43 },
++	{ 0x0420, 0xc0 },
++	{ 0x042c, 0x33 },
++	{ 0x0474, 0x05 },
++	{ 0x04bc, 0x05 },
++	{ 0x0430, 0x0f },
++	{ 0x058c, 0x67 },
++	{ 0x052c, 0x4d },
++	{ 0x0620, 0x9e },
++	{ 0x0640, 0x0e },
++	{ 0x0644, 0x12 },
++	{ 0x0648, 0x15 },
++	{ 0x064c, 0x19 },
++};
++static const struct mu_phy_setting mu_phy_rate_A_g4[] = {
++	{ 0x0474, 0x04 },
++	{ 0x04bc, 0x04 },
++};
++static const struct mu_phy_setting mu_phy_2nd_lane[] = {
++	{ 0x05fc, 0x02 },
++};
++static const struct mu_phy_setting mu_phy_rate_B[] = {
++	{ 0x0140, 0x04 },
++	{ 0x0420, 0xc1 },
++};
+diff --git a/bsd/dev/metroid_ufs_qcom.h b/bsd/dev/metroid_ufs_qcom.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/metroid_ufs_qcom.h
+@@ -0,0 +1,337 @@
++/* SM8735/Tuna + Niobe platform operations, following Nothing031e8669:
++ * ufs_qcom_device_reset, hba_execute_hce callbacks, link_startup callbacks.
++ * External RPMh/PMIC votes are a firmware-provided board prerequisite. This
++ * provider never pretends that powered GDSCs replace regulator ownership.
++ * No shared PLL, display clock or global SMMU reset is performed here.
++ */
++static int
++mu_io_poll(uintptr_t addr, uint32_t mask, uint32_t want, uint32_t timeout)
++{
++	uint64_t start = MU_NOW_US();
++	do {
++		if ((MU_READ32(addr) & mask) == want) { return 0; }
++		MU_DELAY(10);
++	} while (MU_NOW_US() - start < timeout);
++	return ETIMEDOUT;
++}
++static int
++mu_io_update(uintptr_t addr, uint32_t mask, uint32_t value)
++{
++	uint32_t old = MU_READ32(addr);
++	if (old == 0xffffffffu) { return ENXIO; }
++	MU_WRITE32(addr, (old & ~mask) | (value & mask)); MU_BARRIER();
++	uint32_t got = MU_READ32(addr);
++	if ((got & mask) == (value & mask)) { return 0; }
++	MU_LOG("METROID UFS: MMIO addr=%llx mask=%08x want=%08x got=%08x\n",
++	    (unsigned long long)addr, mask, value & mask, got);
++	return EIO;
++}
++static uint32_t
++mu_clock_mhz(uint32_t cfg)
++{
++	if (cfg & (3u << 12)) { return 0; }
++	uint32_t source = (cfg >> 8) & 7, div = cfg & 31;
++	if (source == 6 && div == 5) { return 100; }
++	if (source == 5 && div == 7) { return 202; }
++	if (source == 5 && div == 3) { return 403; }
++	return 0;
++}
++static int
++mu_qcom_resources(struct mu_host *h)
++{
++	h->phase = "platform-resources";
++	if (!h->phy || !h->gcc || !h->reset || (mu_r(h, MU_QCOM_HW_VERSION) >> 28) != 6) { return ENOTSUP; }
++	uint32_t domains[] = { MU_READ32(h->gcc + 0x77004), MU_READ32(h->gcc + 0x9e000) };
++	h->core_mhz = mu_clock_mhz(MU_READ32(h->gcc + 0x77038));
++	h->unipro_mhz = mu_clock_mhz(MU_READ32(h->gcc + 0x770a8));
++	/* SYS1CLK uses integer MHz floor; UniPro's table rounds201.5 up202. */
++	if (h->core_mhz == 202) { h->core_mhz = 201; }
++	MU_LOG("METROID UFS: resources GDSC=%08x/%08x SYS1CLK=%u UniPro=%u\n",
++	    domains[0], domains[1], h->core_mhz, h->unipro_mhz);
++	uint32_t aux = MU_READ32(h->gcc + 0x770c4);
++	for (unsigned i = 0; i < 2; i++) {
++		if (domains[i] == 0xffffffffu || !(domains[i] & (1u << 31))) { return ENXIO; }
++	}
++	if (!h->core_mhz || !h->unipro_mhz || (aux & (7u << 8)) ||
++	    ((aux & 31) != 1 && (aux & 31) != 3)) { return ENXIO; }
++	/* Same board hint used by Nothing's host parameter initialization. */
++	h->phy_gear = ((mu_r(h, 0x284c) >> 4) & 15) >= 4 ? 5 : 4;
++	const uint32_t clocks[] = { 0x77028, 0x77018, 0x770f4, 0x7706c, 0x7707c, 0x770bc };
++	h->phase = "platform-clocks";
++	for (unsigned i = 0; i < sizeof(clocks) / sizeof(clocks[0]); i++) {
++		/* clk_branch2 enable: preserve HW-control and memory-retention fields. */
++		int error = mu_io_update(h->gcc + clocks[i], 1, 1);
++		if (error) { return error; }
++		error = mu_io_poll(h->gcc + clocks[i], 1u << 31, 0, 10000);
++		if (error) {
++			MU_LOG("METROID UFS: clock off=%x CBCR=%08x errno=%d\n", clocks[i], MU_READ32(h->gcc + clocks[i]), error);
++			return error;
++		}
++	}
++	/* Nothing forces retention of AXI/ICE memories on this major6 host. */
++	int error = mu_io_update(h->gcc + 0x77018, 1u << 14, 1u << 14);
++	if (!error) { error = mu_io_update(h->gcc + 0x7707c, 1u << 14, 1u << 14); }
++	MU_LOG("METROID UFS: firmware supply provider; core=%u UniPro=%u MHz Niobe G%u RateB\n",
++	    h->core_mhz, h->unipro_mhz, h->phy_gear);
++	return error;
++}
++static int
++mu_qcom_device_reset(struct mu_host *h)
++{
++	h->phase = "device-reset";
++	/* Dedicated Tuna UFS_RESET pad191, output bit0, active low. */
++	int error = mu_io_update(h->reset, 1, 0);
++	if (error) { return error; }
++	MU_DELAY(10);
++	h->phase = "core-reset";
++	error = mu_io_update(h->gcc + 0x77000, 1, 1);
++	if (!error) {
++		/* Major6: external PHY rails/GDSC stay powered while BCR is held.
++		 * Already-powered provider is a no-op, like Linux is_phy_pwr_on. */
++		MU_DELAY(200);
++		error = mu_io_update(h->gcc + 0x77000, 1, 0);
++		MU_DELAY(1000);
++	}
++	if (!error) {
++		error = mu_io_update(h->regs + MU_QCOM_CFG1, MU_QCOM_REF_CLK | MU_QCOM_NO_ICE_CHECK,
++		    MU_QCOM_REF_CLK | MU_QCOM_NO_ICE_CHECK);
++		MU_DELAY(60);
++	}
++	/* Always release both reset lines; never leave a failed boot holding them. */
++	if (error) { (void)mu_io_update(h->gcc + 0x77000, 1, 0); }
++	int release = mu_io_update(h->reset, 1, 1);
++	MU_DELAY(10);
++	return error ? error : release;
++}
++static void
++mu_phy_table(struct mu_host *h, const struct mu_phy_setting *table, unsigned count)
++{
++	for (unsigned i = 0; i < count; i++) { MU_WRITE32(h->phy + table[i].off, table[i].value); }
++	MU_BARRIER();
++}
++static int
++mu_qcom_phy_init(struct mu_host *h)
++{
++	h->phase = "phy-calibrate";
++	const uint32_t lanes[] = { 0x77030, 0x770d8, 0x7702c };
++	const uint32_t muxes[] = { 0x77068, 0x770ec, 0x77058 };
++	int error = 0;
++	for (unsigned i = 0; i < 3; i++) {
++		error = mu_io_update(h->gcc + lanes[i], 1, 0);
++		if (!error) { error = mu_io_update(h->gcc + muxes[i], 3, 2); }
++		if (error) { return error; }
++	}
++	error = mu_io_update(h->phy + 0x13e0, 1u << 6, 0);
++	if (!error) { error = mu_io_update(h->phy + 0x1be0, 1u << 6, 0); }
++	if (!error) { error = mu_io_update(h->phy + 0x404, 1, 1); }
++	if (error) { return error; }
++	error = mu_io_update(h->regs + MU_QCOM_CFG1, 2, 2);
++	if (error) { return error; }
++	MU_DELAY(1000);
++	error = mu_io_update(h->phy + 0x408, 1, 1);
++	if (error) { goto release_reset; }
++	mu_phy_table(h, mu_phy_rate_A_g5, sizeof(mu_phy_rate_A_g5) / sizeof(mu_phy_rate_A_g5[0]));
++	if (h->phy_gear == 4) { mu_phy_table(h, mu_phy_rate_A_g4, sizeof(mu_phy_rate_A_g4) / sizeof(mu_phy_rate_A_g4[0])); }
++	mu_phy_table(h, mu_phy_2nd_lane, sizeof(mu_phy_2nd_lane) / sizeof(mu_phy_2nd_lane[0]));
++	mu_phy_table(h, mu_phy_rate_B, sizeof(mu_phy_rate_B) / sizeof(mu_phy_rate_B[0]));
++release_reset:
++	{
++		int released = mu_io_update(h->phy + 0x408, 1, 0);
++		int host_release = mu_io_update(h->regs + MU_QCOM_CFG1, 2, 0);
++		MU_DELAY(1000);
++		if (!error) { error = released ? released : host_release; }
++	}
++	if (error) { return error; }
++	error = mu_io_update(h->phy + 0x400, 1, 1);
++	if (error) { return error; }
++	h->phase = "phy-pcs-ready";
++	error = mu_io_poll(h->phy + 0x5a8, 1, 1, 1000000);
++	if (error) { return error; }
++	for (unsigned i = 0; i < 3; i++) {
++		error = mu_io_update(h->gcc + muxes[i], 3, 0);
++		if (!error) { error = mu_io_update(h->gcc + lanes[i], 1, 1); }
++		if (error) { return error; }
++		MU_DELAY(10);
++	}
++	/* select_unipro_mode: source RMW, not an undocumented readback contract. */
++	mu_w(h, MU_QCOM_CFG1, mu_r(h, MU_QCOM_CFG1) | 1);
++	return mu_io_update(h->regs + 0xd8, (1u << 5) | 1, 0);
++}
++static int
++mu_qcom_hce_enable(struct mu_host *h)
++{
++	h->phase = "hce-disable";
++	mu_w(h, 0x34, 0);
++	int error = mu_poll(h, false, 0x34, 1, 0, 10000);
++	if (error) { return error; } /* no new command until old UIC engine stopped */
++	error = mu_qcom_phy_init(h);
++	if (error) { return error; }
++	h->phase = "hce-enable";
++	mu_w(h, 0x34, 1); MU_DELAY(1000);
++	error = mu_poll(h, false, 0x34, 1, 1, 50000);
++	if (error) { return error; }
++	mu_w(h, 0x18, 0); mu_w(h, 0x24, 0);
++	mu_w(h, 0x20, mu_r(h, 0x20));
++	uint64_t start = MU_NOW_US();
++	do {
++		error = mu_uic(h, 1, MU_TX_FSM_ATTRIBUTE, 0, &h->tx_fsm);
++		if (error || h->tx_fsm == MU_TX_FSM_HIBERN8) { return error; }
++		MU_DELAY(100);
++	} while (MU_NOW_US() - start < 100000);
++	return ETIMEDOUT;
++}
++static int
++mu_qcom_link_pre(struct mu_host *h)
++{
++	h->phase = "link-config";
++	mu_w(h, 0xc0, h->core_mhz);
++	if (mu_r(h, 0xc0) != h->core_mhz) { return EIO; }
++	/* Match scale_up=true in Nothing. Recovery403MHz: D002=01930300,
++	 * PA_VS_CORE_CLK_40NS_CYCLES=10; DIV_EN bit8 must not be cleared. */
++	int error = mu_dme_update(h, 0xd002, (0xfffu << 16) | (1u << 8), (h->unipro_mhz << 16) | (1u << 8));
++	if (!error) { error = mu_dme_update(h, 0x9007, 0x3f, h->unipro_mhz == 403 ? 16 : h->unipro_mhz == 202 ? 8 : 4); }
++	if (!error) { error = mu_dme_update(h, 0xa00b, 0x3ff, 0x3ff); }
++	if (!error) { error = mu_dme_update(h, 0x9004, 0x1ff, 0x1ff); }
++	if (!error) { error = mu_dme_update(h, 0xd002, 1u << 9, 1u << 9); }
++	if (!error) { error = mu_io_update(h->regs + 0xe0, 0xff, 0xff); }
++	if (!error) { error = mu_io_update(h->regs + 0xfc, (1u << 11) | (1u << 12), (1u << 11) | (1u << 12)); }
++	if (!error) { error = mu_io_update(h->phy + 0x57c, 2, 0); }
++	if (!error) { error = mu_io_update(h->regs + MU_QCOM_CFG1, MU_QCOM_REF_CLK | MU_QCOM_NO_ICE_CHECK, MU_QCOM_REF_CLK | MU_QCOM_NO_ICE_CHECK); }
++	if (!error) { error = mu_dme_update(h, 0x155e, 1, 0); }
++	uint32_t clock = 0, timing = 0;
++	if (!error) { error = mu_uic(h, 1, 0xd002u << 16, 0, &clock); }
++	if (!error) { error = mu_uic(h, 1, 0x9007u << 16, 0, &timing); }
++	if (!error) { MU_LOG("METROID UFS: UniPro clocks D002=%08x 9007=%08x\n", clock, timing); }
++	return error;
++}
++static int
++mu_qcom_start(struct mu_host *h)
++{
++	int error = mu_qcom_resources(h);
++	if (error) { return error; }
++	error = mu_qcom_device_reset(h);
++	if (error) { return error; }
++	error = mu_qcom_hce_enable(h);
++	if (error) { return error; }
++	/* ufshcd_link_startup: unknown device state needs two successful phases;
++	 * each phase has its own initial attempt plus three HCE/PHY recoveries. */
++	for (unsigned pass = 1; pass <= 2; pass++) {
++		for (unsigned attempt = 1; attempt <= 4; attempt++) {
++			error = mu_qcom_link_pre(h);
++			if (error) { return error; }
++			mu_link_errors(h, "startup-before");
++			mu_w(h, 0x20, 1u << 2);
++			h->phase = "link-startup";
++			MU_LOG("METROID UFS: LINK_STARTUP pass=%u/2 attempt=%u/4\n", pass, attempt);
++			error = mu_uic(h, 0x16, 0, 0, NULL);
++			mu_link_errors(h, "startup-after");
++			/* A nominal command completion cannot hide fresh PA_INIT or
++			 * DME failure. Plain startup LINERESET alone is expected. */
++			if (!error && (((h->link_errors[1] & 0x80002000u) == 0x80002000u) ||
++			    ((h->link_errors[4] & 0x80000001u) == 0x80000001u))) { error = EIO; }
++			if (!error) {
++				if (!(mu_r(h, 0x30) & 1)) { return ENXIO; }
++				break;
++			}
++			/* No transfer/task queue has started. Recover local UIC engine
++			 * only; never clear/abort/reuse a timed-out DMA request. */
++			uint32_t fatal = mu_r(h, 0x20) & (MU_FATAL_IS & ~(1u << 2));
++			uint32_t fault = mu_sr(h, mu_cb(h, h->cb) + 0x58) & MU_SMMU_FSR_FAULT;
++			if (fatal || fault || attempt == 4) { return error; }
++			error = mu_qcom_hce_enable(h);
++			if (error) { return error; }
++		}
++	}
++	uint32_t connected = 0;
++	error = mu_uic(h, 1, 0x1561u << 16, 0, &connected);
++	if (error) { return error; }
++	if (!connected || connected > 2) { return EIO; }
++	(void)mu_r(h, 0x38); /* Linux consumes startup LINERESET before requests. */
++	MU_LOG("METROID UFS: link ready PCS=%08x HCS=%08x lanes=%u\n", MU_READ32(h->phy + 0x5a8), mu_r(h, 0x30), connected);
++	return 0;
++}
++/* High-speed G1..G3: external supplies and interconnect votes are
++ * still inherited. Linux's ufshcd_change_power_mode + QCOM PRE/POST_CHANGE,
++ * capped at G3; G4/G5 adaptation and device tuning remain unimplemented.
++ * No fallback after mutation: an uncertain link must never service disk I/O. */
++static int
++mu_hs_mode(struct mu_host *h, uint32_t cap)
++{
++	if (!cap || cap > 3) { return EINVAL; }
++	if (h->failed || h->state != MU_LINK_READY || !h->mapped) { return EIO; }
++	if (mu_r(h, 0x58) || mu_r(h, 0x78)) { return EBUSY; }
++	h->phase = "hs-capabilities";
++	uint32_t rx = 0, tx = 0, rxmax = 0, txmax = 0;
++	int error = mu_uic(h, 1, 0x1581u << 16, 0, &rx);
++	if (!error) { error = mu_uic(h, 1, 0x1561u << 16, 0, &tx); }
++	if (!error) { error = mu_uic(h, 1, 0x1587u << 16, 0, &rxmax); }
++	if (!error) { error = mu_uic(h, 3, 0x1587u << 16, 0, &txmax); } /* peer RX */
++	if (error) { return error; }
++	if (!rx || rx > 2 || !tx || tx > 2 || !rxmax || rxmax > 5 || !txmax || txmax > 5) { return ENOTSUP; }
++	uint32_t gear = cap < rxmax ? cap : rxmax;
++	if (gear > txmax) { gear = txmax; }
++	/* REF_CLK was enabled and settled before link startup. Preserve the
++ * calibrated Rate-B PHY and actual-rate SYS1CLK/UniPro timer settings. */
++	if ((mu_r(h, MU_QCOM_CFG1) & MU_QCOM_REF_CLK) == 0 ||
++	    mu_r(h, 0xc0) != h->core_mhz) { return EIO; }
++	h->phase = "hs-config";
++	const struct { uint16_t attr; uint32_t value; } settings[] = {
++		{ 0x15d4, 3 }, /* PA_TXHSADAPTTYPE = PA_NO_ADAPT for G1..G3 */
++		{ 0x1583, gear }, { 0x1580, rx }, { 0x1584, 1 },
++		{ 0x1568, gear }, { 0x1560, tx }, { 0x1569, 1 },
++		{ 0x156a, 2 }, /* PA_HSSERIES = Rate B */
++		{ 0x15b0, 8191 }, { 0x15b1, 65535 }, { 0x15b2, 32767 },
++		{ 0x15b3, 8191 }, { 0x15b4, 65535 }, { 0x15b5, 32767 },
++		{ 0xd041, 8191 }, { 0xd042, 65535 }, { 0xd043, 32767 },
++	};
++	for (unsigned i = 0; i < sizeof(settings) / sizeof(settings[0]); i++) {
++		error = mu_uic_command(h, 2, (uint32_t)settings[i].attr << 16, settings[i].value, 0, NULL);
++		if (error) { goto failed; }
++	}
++	h->phase = "hs-power-mode";
++	/* FAST/FAST: UIC completion alone is insufficient; wait for UPMS and
++ * require UPMCRS=PWR_LOCAL, exactly like ufshcd_uic_pwr_ctrl. */
++	error = mu_uic_command(h, 2, 0x1571u << 16, 0x11, 1u << 4, NULL);
++	if (error) { goto failed; }
++	h->phase = "hs-verify";
++	const struct { uint16_t attr; uint32_t value; } verify[] = {
++		{ 0x1571, 0x11 }, { 0x1583, gear }, { 0x1568, gear },
++		{ 0x1580, rx }, { 0x1560, tx }, { 0x156a, 2 },
++	};
++	for (unsigned i = 0; i < sizeof(verify) / sizeof(verify[0]); i++) {
++		uint32_t actual = 0;
++		error = mu_uic(h, 1, (uint32_t)verify[i].attr << 16, 0, &actual);
++		if (!error && actual != verify[i].value) { error = EIO; }
++		if (error) { goto failed; }
++	}
++	if ((mu_r(h, 0x20) & MU_FATAL_IS) ||
++	    (mu_sr(h, mu_cb(h, h->cb) + 0x58) & MU_SMMU_FSR_FAULT)) { error = EIO; goto failed; }
++	MU_LOG("METROID UFS: HS-G%u Rate-B FAST/FAST verified RX-lanes=%u TX-lanes=%u (requested cap=%u)\n", gear, rx, tx, cap);
++	return 0;
++failed:
++	mu_fail(h); mu_dump(h, "hs-failed"); return error;
++}
++
++static int
++mu_start_host(struct mu_host *h)
++{
++	if (!h->mapped || h->failed) { return EIO; }
++	if (h->state != MU_DMA_READY || mu_r(h, 0x58) || mu_r(h, 0x78) ||
++	    (mu_r(h, 0x60) & 1) || (mu_r(h, 0x80) & 1)) { return EBUSY; }
++	int error = mu_qcom_start(h);
++	if (error) { mu_fail(h); mu_dump(h, "platform-failed"); return error; }
++	h->phase = "queue-start";
++	error = mu_poll(h, false, 0x30, 0xf, 0xf, 1000000);
++	if (error) { mu_fail(h); return error; }
++	mu_w(h, 0x4c, 0); mu_w(h, 0x20, mu_r(h, 0x20));
++	mu_w(h, 0x50, (uint32_t)MU_IOVA); mu_w(h, 0x54, 0);
++	mu_w(h, 0x70, (uint32_t)(MU_IOVA + MU_TASK)); mu_w(h, 0x74, 0);
++	MU_FLUSH((uintptr_t)h->pool, MU_POOL_SIZE); MU_BARRIER();
++	if (mu_r(h, 0x50) != MU_IOVA || mu_r(h, 0x54) ||
++	    mu_r(h, 0x70) != MU_IOVA + MU_TASK || mu_r(h, 0x74)) { mu_fail(h); return EIO; }
++	mu_w(h, 0x80, 1); mu_w(h, 0x60, 1);
++	error = mu_poll(h, false, 0x60, 1, 1, 10000);
++	if (error) { mu_fail(h); return error; }
++	h->state = MU_LINK_READY;
++	return 0;
++}
+diff --git a/bsd/dev/metroid_ufs_smmu.h b/bsd/dev/metroid_ufs_smmu.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/metroid_ufs_smmu.h
+@@ -0,0 +1,216 @@
++/* Per-UFS SMMUv2 stage1 domain; preserve all other firmware streams.
++ * arm-smmu/qsmmuv500 and fastmap reference: Nothing031e8669. */
++static bool
++mu_smr_matches(uint32_t smr)
++{
++	uint32_t mask = (smr >> 16) & 0x7fff;
++	return (smr & (1u << 31)) && !(((smr & 0xffff) ^ MU_SID) & ~mask);
++}
++
++/* Find the exact UFS stream, then allocate a fresh stage-1 context bank.
++ * Every context referenced by firmware, including UFS, remains reserved.
++ * No global reset, CLIENTPD change or unrelated-stream TLB invalidation. */
++static int
++mu_choose_context(struct mu_host *h)
++{
++	uint32_t id0 = mu_sr(h, 0x20), id1 = mu_sr(h, 0x24), id2 = mu_sr(h, 0x28);
++	uint32_t scr0 = mu_sr(h, 0);
++	MU_LOG("METROID SMMU: ID0=%08x ID1=%08x ID2=%08x CR0=%08x\n", id0, id1, id2, scr0);
++	if (!id0 || id0 == UINT32_MAX || !id1 || id1 == UINT32_MAX || id2 == UINT32_MAX ||
++	    !(id0 & (1u << 30)) || !(id0 & (1u << 27)) || !(id2 & (1u << 12)) ||
++	    (scr0 & ((1u << 0) | (1u << 3)))) {
++		MU_LOG("METROID SMMU: need active SMMUv2 stage-1/4K/SMR, no extended IDs; ID=%08x/%08x/%08x CR0=%08x\n", id0, id1, id2, scr0);
++		return ENOTSUP;
++	}
++	h->pgshift = (id1 & (1u << 31)) ? 16 : 12;
++	h->gr1 = 1u << h->pgshift;
++	h->cb_base = (1u << (((id1 >> 28) & 7) + 1)) << h->pgshift;
++	h->ncb = id1 & 0xff;
++	h->ns2cb = (id1 >> 16) & 0xff;
++	h->nsmr = id0 & 0xff;
++	/* Stage-1 output width is ID2.IAS (IPA width), not ID2.OAS. */
++	h->ips = id2 & 0xf;
++	/* QSMMUv500 exposes more than 128 SMR/S2CR groups (138 on Metroid).
++	 * Nothing's qsmmuv500_impl retains ID0.NUMSMRG; the generic Qualcomm
++	 * implementation's 128-group workaround is not installed for this IP.
++	 * The 8-bit count bounds both arrays of registers inside GR0: up to
++	 * SMR[254] at 0xbf8 and S2CR[254] at 0xff8. Context-bank bookkeeping
++	 * below is indexed by CBNDX, not by the number of streams.
++	 */
++	if (!h->ncb || h->ncb > 128 || !h->nsmr ||
++	    h->ns2cb >= h->ncb || h->ips > 5 ||
++	    (uint64_t)h->cb_base + ((uint64_t)h->ncb << h->pgshift) > 0x100000) {
++		MU_LOG("METROID SMMU: unsupported geometry: page_shift=%u CB_base=%x contexts=%u stage2_only=%u SMRs=%u IPS=%u aperture=100000\n",
++		    h->pgshift, h->cb_base, h->ncb, h->ns2cb, h->nsmr, h->ips);
++		return ENOTSUP;
++	}
++	bool referenced[128] = { false }, used_asid[256] = { false };
++	uint32_t matches = 0, free_smr = UINT32_MAX;
++	h->smr = UINT32_MAX;
++	for (uint32_t i = 0; i < h->nsmr; i++) {
++		uint32_t s = mu_sr(h, 0x800 + 4 * i), c = mu_sr(h, 0xc00 + 4 * i);
++		if (!(s & (1u << 31))) { if (free_smr == UINT32_MAX) { free_smr = i; } continue; }
++		if (mu_smr_matches(s)) { h->smr = i; matches++; }
++		if (((c >> 16) & 3) == 0 && (c & 0xff) < h->ncb) { referenced[c & 0xff] = true; }
++	}
++	if (matches > 1) { return EBUSY; }
++	h->cb = UINT32_MAX;
++	if (matches == 1) {
++		h->old_smr = mu_sr(h, 0x800 + 4 * h->smr);
++		h->old_s2cr = mu_sr(h, 0xc00 + 4 * h->smr);
++		if (h->old_smr != ((1u << 31) | MU_SID)) { return EBUSY; }
++
++	} else {
++		if (free_smr == UINT32_MAX) { return ENOSPC; }
++		h->smr = free_smr;
++		h->old_smr = mu_sr(h, 0x800 + 4 * h->smr);
++		h->old_s2cr = mu_sr(h, 0xc00 + 4 * h->smr);
++	}
++	for (uint32_t i = h->ns2cb; i < h->ncb; i++) {
++		uint32_t b = mu_cb(h, i);
++		uint64_t ttbr = mu_sr64(h, b + 0x20), ttbr1 = mu_sr64(h, b + 0x28);
++		used_asid[(ttbr >> 48) & 0xff] = true;
++		used_asid[(ttbr1 >> 48) & 0xff] = true;
++		if (h->cb == UINT32_MAX && !referenced[i] && !(mu_sr(h, b) & 1)) { h->cb = i; }
++	}
++	if (h->cb == UINT32_MAX) {
++		MU_LOG("METROID SMMU: no unused disabled stage-1 context; firmware contexts preserved\n");
++		return ENOSPC;
++	}
++	MU_LOG("METROID SMMU: allocate fresh CB=%u; firmware UFS S2CR=%08x is preserved until attach\n",
++	    h->cb, h->old_s2cr);
++	h->asid = 0;
++	for (uint32_t i = 1; i < 256; i++) { if (!used_asid[i]) { h->asid = i; break; } }
++	return h->asid ? 0 : ENOSPC;
++}
++
++/* Three 4K tables: 32-bit IOVA -> L1 (four entries) -> L2 -> L3.
++ * Only the DMA pool is mapped; neighbouring pages and all other IOVAs fault.
++ * SMMU's 4K granule is independent of the CPU's 16K XNU page size. */
++static int
++mu_build_tables(struct mu_host *h)
++{
++	static const uint8_t pa_bits[] = { 32, 36, 40, 42, 44, 48 };
++	if (!h->tables || !h->pool || h->ips > 5 || (h->pool_pa & 4095) ||
++	    (h->tables_pa & 4095) || h->pool_pa > (1ull << pa_bits[h->ips]) - MU_POOL_SIZE ||
++	    h->tables_pa > (1ull << pa_bits[h->ips]) - MU_TABLE_SIZE) { return EINVAL; }
++	memset(h->tables, 0, MU_TABLE_SIZE);
++	uint64_t *l1 = h->tables, *l2 = l1 + 512, *l3 = l2 + 512;
++	l1[(MU_IOVA >> 30) & 3] = (h->tables_pa + 0x1000) | 3;
++	l2[(MU_IOVA >> 21) & 511] = (h->tables_pa + 0x2000) | 3;
++	for (uint32_t i = 0; i < MU_POOL_SIZE / 4096; i++) {
++		/* AF, inner-shareable, unprivileged R/W, AttrIdx0 WB, nG, XN. */
++		l3[i] = (h->pool_pa + (uint64_t)i * 4096) | 3 | (1u << 6) |
++		    (3u << 8) | (1u << 10) | (1u << 11) | (3ull << 53);
++	}
++	MU_CLEAN((uintptr_t)h->tables, MU_TABLE_SIZE);
++	MU_BARRIER();
++	return 0;
++}
++
++static int
++mu_tlb_sync(struct mu_host *h, uint32_t asid)
++{
++	uint32_t b = mu_cb(h, h->cb);
++	mu_sw(h, b + 0x610, asid);
++	mu_sw(h, b + 0x7f0, 0);
++	return mu_poll(h, true, b + 0x7f4, 1, 0, 100000);
++}
++
++/* Linux writes configuration without whole-register equality checks.
++ * Report normalization, but only reject differences that would change the
++ * translation format, page-table address, or UFS stream destination. */
++static int
++mu_check32(struct mu_host *h, uint32_t off, uint32_t want, uint32_t mask, const char *name)
++{
++	uint32_t got = mu_sr(h, off);
++	if (got != want) {
++		MU_LOG("METROID SMMU: %s readback want=%08x got=%08x required=%08x %s\n",
++		    name, want, got, mask, ((got ^ want) & mask) ? "blocked/incompatible" : "continuing");
++	}
++	return ((got ^ want) & mask) ? EPERM : 0;
++}
++
++static int
++mu_check_ttbr(struct mu_host *h, uint32_t off, uint64_t want)
++{
++	uint64_t got = mu_sr64(h, off);
++	const uint64_t mask = MU_ADDR_MASK | (0xffffull << 48);
++	if (got != want) {
++		MU_LOG("METROID SMMU: TTBR0 readback want=%llx got=%llx %s\n",
++		    (unsigned long long)want, (unsigned long long)got,
++		    ((got ^ want) & mask) ? "blocked/incompatible" : "continuing");
++	}
++	return ((got ^ want) & mask) ? EPERM : 0;
++}
++
++static int
++mu_map_dma(struct mu_host *h)
++{
++	h->phase = "dma-map";
++	if (mu_r(h, 0x58) || mu_r(h, 0x78) || (mu_r(h, 0x60) & 1) || (mu_r(h, 0x80) & 1)) { return EBUSY; }
++	int error = mu_choose_context(h);
++	if (error) { return error; }
++	/* Nothing's qsmmuv500_cfg_probe clears only this implementation bit.
++	 * Firmware may protect it; preserve every other sACR bit and report
++	 * blocked writes like Linux, without resetting global SMMU state. */
++	uint32_t acr = mu_sr(h, 0x10);
++	if (acr & (1u << 26)) {
++		mu_sw(h, 0x10, acr & ~(1u << 26));
++		MU_LOG("METROID SMMU: CACHE_LOCK old=%08x new=%08x%s\n", acr, mu_sr(h, 0x10),
++		    (mu_sr(h, 0x10) & (1u << 26)) ? " firmware-locked" : " cleared");
++	}
++	error = mu_build_tables(h);
++	if (error) { return error; }
++	uint32_t b = mu_cb(h, h->cb);
++	/* The UFS engines are stopped. Keep this context disabled on failure;
++	 * the permanent pool/tables remain pinned for any late device accesses. */
++	h->configured = true; h->state = MU_DMA_READY;
++	uint32_t old_asid = (uint32_t)(mu_sr64(h, b + 0x20) >> 48);
++	mu_sw(h, b, 0);
++	if ((error = mu_check32(h, b, 0, 1, "SCTLR disable"))) { goto fail; }
++	if (mu_tlb_sync(h, old_asid)) { error = ETIMEDOUT; goto fail; }
++	uint32_t cbar = (1u << 16) | (0xfu << 12) | (3u << 8);
++	/* Linux io-pgtable's noncoherent-walk case: outer-shareable, inner
++	 * and outer noncacheable table reads. Tables are explicitly cleaned
++	 * above and immutable while attached; firmware coherency is not assumed.
++	 * Endpoint PTEs remain Normal WB and use explicit cache ownership below. */
++	uint32_t tcr = (1u << 23) | (2u << 12) | 32;
++	uint32_t tcr2 = (7u << 15) | h->ips; /* 8-bit ASID; TCR2.AS stays zero */
++	uint64_t ttbr = h->tables_pa | ((uint64_t)h->asid << 48);
++	mu_sw(h, h->gr1 + 0x800 + 4 * h->cb, 1); /* AArch64 */
++	mu_sw(h, h->gr1 + 4 * h->cb, cbar);
++	mu_sw(h, b + 0x10, tcr2);
++	mu_sw(h, b + 0x30, tcr);
++	mu_sw64(h, b + 0x20, ttbr);
++	mu_sw64(h, b + 0x28, 0);
++	mu_sw(h, b + 0x38, 0xff); /* MAIR0 Attr0: Normal WB */
++	mu_sw(h, b + 0x3c, 0);
++	mu_sw(h, b + 0x58, mu_sr(h, b + 0x58) & MU_SMMU_FSR_FAULT);
++	if ((error = mu_check32(h, h->gr1 + 0x800 + 4 * h->cb, 1, 1, "CBA2R VA64")) ||
++	    (error = mu_check32(h, h->gr1 + 4 * h->cb, cbar, 3u << 16, "CBAR stage")) ||
++	    (error = mu_check32(h, b + 0x10, tcr2, 0xf, "TCR2 PA size")) ||
++	    (error = mu_check32(h, b + 0x30, tcr, (1u << 23) | (1u << 22) | (3u << 14) | (1u << 7) | 0x3f, "TCR format")) ||
++	    (error = mu_check_ttbr(h, b + 0x20, ttbr)) ||
++	    (error = mu_check32(h, b + 0x38, 0xff, 0xff, "MAIR Attr0"))) { goto fail; }
++	if (mu_tlb_sync(h, h->asid)) { error = ETIMEDOUT; goto fail; }
++	/* Abort on faults rather than stall forever; poll FSR instead of using IRQ. */
++	uint32_t sctlr = (1u << 12) | (1u << 5) | (1u << 2) | (1u << 1) | 1;
++	mu_sw(h, b, sctlr);
++	if ((error = mu_check32(h, b, sctlr, 1, "SCTLR enable"))) { goto fail; }
++	/* Linux uses TRANS + PRIVCFG_DEFAULT when attaching a DMA domain. */
++	uint32_t s2cr = h->cb;
++	mu_sw(h, 0xc00 + 4 * h->smr, s2cr);
++	if ((error = mu_check32(h, 0xc00 + 4 * h->smr, s2cr, (3u << 16) | 0xff, "S2CR route"))) { goto fail; }
++	mu_sw(h, 0x800 + 4 * h->smr, (1u << 31) | MU_SID);
++	if ((error = mu_check32(h, 0x800 + 4 * h->smr, (1u << 31) | MU_SID, UINT32_MAX, "SMR match"))) { goto fail; }
++	h->mapped = true;
++	MU_LOG("METROID DMA: SID=60 SMR=%u CB=%u ASID=%u IOVA=%llx PA=%llx bytes=%x TTBR=%llx (NC table walks, explicit cache sync)\n",
++	    h->smr, h->cb, h->asid, (unsigned long long)MU_IOVA,
++	    (unsigned long long)h->pool_pa, MU_POOL_SIZE, (unsigned long long)h->tables_pa);
++	return 0;
++fail:
++	mu_sw(h, b, 0);
++	mu_fail(h);
++	return error;
++}
+diff --git a/bsd/dev/metroid_ufs_uic.h b/bsd/dev/metroid_ufs_uic.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/metroid_ufs_uic.h
+@@ -0,0 +1,57 @@
++/* UIC command engine: ufshcd_send_uic_cmd/ufshcd_uic_pwr_ctrl reference.
++ * Caller serializes access and drains transfer/task queues before power
++ * changes. Startup recovery is allowed only before those queues start.
++ */
++static void
++mu_link_errors(struct mu_host *h, const char *when)
++{
++	for (unsigned i = 0; i < 5; i++) { h->link_errors[i] = mu_r(h, 0x38 + 4 * i); }
++	MU_LOG("METROID UFS: %s PA=%08x DL=%08x NL=%08x TL=%08x DME=%08x IS=%08x HCS=%08x\n",
++	    when, h->link_errors[0], h->link_errors[1], h->link_errors[2],
++	    h->link_errors[3], h->link_errors[4], mu_r(h, 0x20), mu_r(h, 0x30));
++}
++
++static int
++mu_uic_command(struct mu_host *h, uint32_t command, uint32_t arg1,
++    uint32_t arg3, uint32_t power_event, uint32_t *value)
++{
++	h->uic_result = 0xffffffffu;
++	int error = mu_poll(h, false, 0x30, 1u << 3, 1u << 3, 500000);
++	if (error) { goto out; }
++	mu_w(h, 0x20, MU_UIC_DONE | power_event);
++	mu_w(h, 0x94, arg1); mu_w(h, 0x98, 0); mu_w(h, 0x9c, arg3);
++	mu_w(h, 0x90, command);
++	error = mu_poll(h, false, 0x20, MU_UIC_DONE, MU_UIC_DONE, 500000);
++	if (error) { goto out; }
++	h->uic_result = mu_r(h, 0x98) & 0xff;
++	mu_w(h, 0x20, MU_UIC_DONE);
++	if (h->uic_result) { error = EIO; goto out; }
++	if (value) { *value = mu_r(h, 0x9c); }
++	if (power_event) {
++		error = mu_poll(h, false, 0x20, power_event, power_event, 500000);
++		if (error) { goto out; }
++		uint32_t status = (mu_r(h, 0x30) >> 8) & 7;
++		mu_w(h, 0x20, power_event);
++		if (status != 1) { error = EIO; }
++	}
++out:
++	if (error) {
++		MU_LOG("METROID UFS: UIC cmd=%02x arg1=%08x arg3=%08x result=%08x errno=%d\n",
++		    command, arg1, arg3, h->uic_result, error);
++	}
++	return error;
++}
++static int
++mu_uic(struct mu_host *h, uint32_t command, uint32_t arg1,
++    uint32_t power_event, uint32_t *value)
++{
++	return mu_uic_command(h, command, arg1, 0, power_event, value);
++}
++static int
++mu_dme_update(struct mu_host *h, uint32_t attr, uint32_t mask, uint32_t value)
++{
++	uint32_t old;
++	int error = mu_uic(h, 1, attr << 16, 0, &old);
++	return error ? error : mu_uic_command(h, 2, attr << 16,
++	    (old & ~mask) | (value & mask), 0, NULL);
++}

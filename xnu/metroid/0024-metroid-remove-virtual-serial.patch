@@ -1,0 +1,68 @@
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -26,7 +26,6 @@
+ #include <pexpert/arm/consistent_debug.h>
+ #include <pexpert/arm64/board_config.h>
+ #include <arm64/proc_reg.h>
+-#include <arm64/sweet_early.h>
+ #include <pexpert/arm/protos.h>
+ #include <kern/sched_prim.h>
+ #if HIBERNATION
+@@ -698,26 +697,6 @@
+ 	gPESF = fns;
+ }
+ 
+-/* Reuse the permanent Metroid console; no second framebuffer mapping. */
+-static void metroid_serial_init(void) {}
+-static unsigned int metroid_tx_ready(void) { return 1; }
+-static unsigned int metroid_rx_ready(void) { return 0; }
+-static uint8_t metroid_rx(void) { return 0; }
+-static void metroid_tx(uint8_t c) { sweet_early_putc((char)c); }
+-SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) metroid_serial = {
+-    .init = metroid_serial_init, .transmit_ready = metroid_tx_ready,
+-    .transmit_data = metroid_tx, .receive_ready = metroid_rx_ready,
+-    .receive_data = metroid_rx, .device = SERIAL_SWEET_FBCON
+-};
+-static void fbcon_probe(void)
+-{
+-    static bool registered;
+-    if (!registered && sweet_early_ready()) {
+-        register_serial_functions(&metroid_serial);
+-        registered = true;
+-    }
+-}
+-
+ #if HIBERNATION
+ /**
+  * Transitions the serial driver into a mode that can be run in the hibernation
+@@ -797,8 +776,6 @@
+ 	}
+ 
+ 	PE_parse_boot_argn("disable-uart-irq", &disable_uart_irq, sizeof(disable_uart_irq));
+-
+-	fbcon_probe();
+ 
+ #ifdef PI3_UART
+ 	if (SecureDTFindEntry("name", "gpio", &entryP) == kSuccess) {
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -15,7 +15,7 @@
+ }
+ int sweet_early_ready(void) { return metroid_console_ready(); }
+ int sweet_early_owns_console(void) { return !framebuffer_console; }
+-/* The virtual serial sink must not draw over XNU's video console.
++/* The early renderer must not draw over XNU's video console.
+  * Normal printf/IOLog output now follows the native console dispatcher. */
+ void sweet_early_framebuffer_console(void)
+ {
+@@ -42,7 +42,7 @@
+     metroid_console_relocate(base);
+     sweet_early_mark(9, "final console mappings live");
+ }
+-void sweet_early_disable(void) { /* also used by the normal serial sink */ }
++void sweet_early_disable(void) { /* Ownership changes at framebuffer handoff. */ }
+ void sweet_early_panic(const char *fmt, va_list *args)
+ {
+     if (framebuffer_console || panicking) return;

@@ -1,0 +1,21 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -2203,13 +2203,17 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	set_mmu_ttb_alternate(cpu_ttep & TTBR_BADDR_MASK);
+ 	sweet_early_mark(34, "VM TTBR1 switched");
+ 
+ 	ml_enable_monitor();
++	sweet_early_mark(35, "VM monitor hook returned");
+ 
+ #if defined(SWEET)
+ 	/* The final TTBR1 is live; leave the outgoing VA=PA framebuffer alias. */
+ 	sweet_early_relocate(SWEET_EARLY_FB_VA);
++	sweet_early_mark(36, "VM console using final alias");
+ #endif
++	sweet_early_mark(37, "VM disabling TTBR0");
+ 	set_mmu_ttb(invalid_ttep & TTBR_BADDR_MASK);
++	sweet_early_mark(38, "VM TTBR0 replaced");
+ 
+ 	flush_mmu_tlb();
+ 	sweet_early_mark(10, "TTBR0 off; TLB flushed");

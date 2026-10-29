@@ -1,0 +1,53 @@
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -1,18 +1,27 @@
+-/* Metroid early diagnostics; console remains available as the serial sink. */
++/* Metroid early diagnostics; XNU owns display output after handoff. */
+ #include <arm64/sweet_early.h>
+ #include <kern/misc_protos.h>
+ #include "metroid_console.h"
+-static unsigned started, panicking;
++static unsigned started, panicking, framebuffer_console;
+ void sweet_early_putc(char c)
+ {
++    if (framebuffer_console) return;
+     if (!started) { started = 1; metroid_console_init(); }
+     metroid_console_putc(c);
+ }
+-void sweet_early_flush(void) { metroid_console_flush(); }
++void sweet_early_flush(void)
++{
++    if (!framebuffer_console) metroid_console_flush();
++}
+ int sweet_early_ready(void) { return metroid_console_ready(); }
+-static unsigned framebuffer_console;
+ int sweet_early_owns_console(void) { return !framebuffer_console; }
+-void sweet_early_framebuffer_console(void) { framebuffer_console = 1; }
++/* The virtual serial sink must not draw over XNU's video console.
++ * Normal printf/IOLog output now follows the native console dispatcher. */
++void sweet_early_framebuffer_console(void)
++{
++    sweet_early_flush();
++    framebuffer_console = 1;
++}
+ int sweet_early_framebuffer(uint64_t *base, uint32_t *width,
+     uint32_t *height, uint32_t *stride)
+ {
+@@ -20,6 +29,7 @@
+ }
+ void sweet_early_mark(unsigned stage, const char *label)
+ {
++    if (framebuffer_console) return;
+     if (!started) { started = 1; metroid_console_init(); }
+     metroid_console_string("METROID XNU ");
+     if (stage >= 10) metroid_console_putc('0' + stage / 10);
+@@ -35,7 +45,7 @@
+ void sweet_early_disable(void) { /* also used by the normal serial sink */ }
+ void sweet_early_panic(const char *fmt, va_list *args)
+ {
+-    if (panicking) return;
++    if (framebuffer_console || panicking) return;
+     panicking = 1;
+     metroid_console_string("\nMETROID PANIC: ");
+     va_list copy; va_copy(copy, *args);

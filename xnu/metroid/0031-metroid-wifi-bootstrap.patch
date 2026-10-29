@@ -1,0 +1,512 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -107,6 +107,7 @@
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/metroid_touch.c			standard
++bsd/dev/metroid_wifi.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -863,6 +863,10 @@
+ 	 */
+ 	bsd_init_kprintf("calling net_init_run\n");
+ 	net_init_run();
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	extern void metroid_wifi_init(void);
++	metroid_wifi_init();
++#endif
+ #endif /* NETWORKING */
+ 
+ 	bsd_init_kprintf("calling inittodr\n");
+--- /dev/null
++++ b/bsd/dev/metroid_wifi.c
+@@ -0,0 +1,95 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ * WCN7750 port, stage 1: opt-in read-only APPS/WPSS shared-memory discovery.
++ * Does NOT enable the radio or attach a fake network interface.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/kalloc.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "metroid_wifi_wire.h"
++#include "metroid_wifi_smem.h"
++#include "metroid_wifi_desc.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void ml_io_unmap(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++void metroid_wifi_init(void);
++
++/* Captured Metroid DT: SMEM reserved RAM, APPS0/WPSS13 private partition.
++ * Do not sweep other processor partitions: they may be access restricted.
++ */
++#define MW_SMEM_PA 0x81d00000ull
++#define MW_SMEM_SIZE 0x200000u
++#define MW_WPSS_HOST 13u
++static unsigned mw_started;
++
++static bool mw_copy_region(uint8_t *dst, uint64_t pa, size_t n)
++{
++	/* Sizes are multiples of8, but a partition need not start on a16KiB
++	 * page. Map the containing pages and apply the validated byte offset.
++	 */
++	uint64_t base = pa & ~(uint64_t)PAGE_MASK;
++	size_t bias = (size_t)(pa - base);
++	vm_size_t mapped = (vm_size_t)round_page(bias + n);
++	vm_offset_t va = ml_io_map((vm_offset_t)base, mapped);
++	if (!va) return false;
++	__asm__ volatile("dmb oshld" ::: "memory");
++	for (size_t i = 0; i < n; i += 4) {
++		uint32_t v = *(volatile uint32_t *)(va + bias + i);
++		mw_put32(dst + i, v);
++	}
++	__asm__ volatile("dmb oshld" ::: "memory");
++	ml_io_unmap(va, mapped);
++	return true;
++}
++
++static void mw_thread(void *arg __unused, wait_result_t result __unused)
++{
++	uint8_t *snapshot = kalloc_data(MW_SMEM_SIZE, Z_WAITOK | Z_ZERO);
++	struct mw_smem_partition part;
++	struct mw_glink_snapshot g;
++	int r;
++	if (!snapshot) { printf("METROID WIFI: snapshot allocation failed\n"); goto out; }
++	/* Only the global header and partition table are read before choosing
++	 * the APPS/WPSS partition. Snapshot parsing never dereferences device data.
++	 */
++	if (!mw_copy_region(snapshot, MW_SMEM_PA, 4096) ||
++	    !mw_copy_region(snapshot + MW_SMEM_SIZE - 4096,
++	    MW_SMEM_PA + MW_SMEM_SIZE - 4096, 4096)) {
++		printf("METROID WIFI: SMEM metadata mapping failed\n"); goto done;
++	}
++	r = mw_smem_locate(snapshot, MW_SMEM_SIZE, MW_WPSS_HOST, &part);
++	if (r) { printf("METROID WIFI: WPSS partition unavailable kind=%d; need firmware startup\n", r); goto done; }
++	printf("METROID WIFI: WPSS SMEM partition off=%#lx size=%#lx\n",
++	    (unsigned long)part.offset, (unsigned long)part.size);
++	if (!mw_copy_region(snapshot + part.offset, MW_SMEM_PA + part.offset, part.size)) {
++		printf("METROID WIFI: WPSS snapshot mapping failed\n"); goto done;
++	}
++	r = mw_smem_glink(snapshot, MW_SMEM_SIZE, MW_WPSS_HOST, &g);
++	if (r) { printf("METROID WIFI: GLINK items unavailable kind=%d; need WPSS/GLINK startup\n", r); goto done; }
++	printf("METROID WIFI: inherited GLINK tx=%u/%u rx=%u/%u, sizes=%lu/%lu\n",
++	    g.tx_head, g.tx_tail, g.rx_head, g.rx_tail,
++	    (unsigned long)g.tx.size, (unsigned long)g.rx.size);
++	printf("METROID WIFI: discovery only; GLINK ownership and firmware liveness unverified, radio not enabled\n");
++done:
++	kfree_data(snapshot, MW_SMEM_SIZE);
++out:
++	(void)thread_terminate(current_thread());
++}
++
++void metroid_wifi_init(void)
++{
++	int enabled = 0;
++	thread_t thread;
++	(void)PE_parse_boot_argn("metroid_wifi_probe", &enabled, sizeof(enabled));
++	if (enabled != 1 || __atomic_exchange_n(&mw_started, 1, __ATOMIC_ACQUIRE)) return;
++	printf("METROID WIFI: stage1 WCN7750 SMEM discovery (read-only)\n");
++	kern_return_t kr = kernel_thread_start(mw_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) thread_deallocate(thread);
++	else printf("METROID WIFI: thread start failed %d\n", kr);
++}
++#endif
+--- /dev/null
++++ b/bsd/dev/metroid_wifi_desc.h
+@@ -0,0 +1,58 @@
++/* SPDX-License-Identifier: BSD-3-Clause
++ * WCN7750 descriptor encoding. Layout and masks cross-checked against:
++ * - AirportWCN7850 qwz/qwzreg.h (OpenBSD/Qualcomm ath12k-derived definitions)
++ * - NothingOSS 031e8669 fw-api/hw/wcn7750/v1/{buffer_addr_info,
++ *   tcl_data_cmd,ce_src_desc}.h (Qualcomm ISC license).
++ * These encoders are new code; the descriptors are little-endian wire data.
++ * Caller supplies a mapped DEVICE address, never an assumed physical address.
++ * Encoding does not grant DMA ownership, publish a ring, or imply completion.
++ */
++#ifndef METROID_WIFI_DESC_H
++#define METROID_WIFI_DESC_H
++struct mw_tx_desc_args {
++	uint64_t dma;
++	uint32_t cookie;
++	unsigned manager, bank, length, offset, tid, vdev;
++};
++
++static inline bool mw_dma40(uint64_t addr, size_t length)
++{ return length && addr && addr < (1ull << 40) && length <= (1ull << 40) - addr; }
++
++/* Minimal native-Wi-Fi TX command. TX bank encryption/encapsulation and peer
++ * setup are separate hardware/WMI operations and must precede submission.
++ * Loop/ring bits are zero, as in qwz's fresh TX command; not a ring producer.
++ */
++static inline int
++mw_tcl_encode(uint8_t *dst, size_t n, const struct mw_tx_desc_args *a)
++{
++	if (!dst || n < 32 || !a || a->length > 65535 || a->offset > 511 ||
++	    !mw_dma40(a->dma, (size_t)a->length + a->offset) || !a->length ||
++	    a->cookie > 0xfffff || a->manager > 15 || a->bank > 63 ||
++	    a->tid > 15 || a->vdev > 255) return MW_INVALID;
++	uint32_t words[8] = {
++		(uint32_t)a->dma,
++		(uint32_t)(a->dma >> 32) | (a->manager << 8) | (a->cookie << 12),
++		a->bank << 2, 0,
++		a->length | (a->offset << 23),
++		1u | (a->tid << 4) | (a->vdev << 24), 0, 0
++	};
++	for (unsigned i = 0; i < 8; i++) mw_put32(dst + i * 4, words[i]);
++	return 32;
++}
++
++/* CE source buffer, no gather or byte swapping. WCN7750's barrier_read is
++ * explicitly selectable; Airport's subset did not expose this bit.
++ */
++static inline int
++mw_ce_encode(uint8_t *dst, size_t n, uint64_t dma, unsigned length,
++    unsigned metadata, bool barrier_read)
++{
++	if (!dst || n < 16 || !mw_dma40(dma, length) || length > 65535 ||
++	    metadata > 65535) return MW_INVALID;
++	mw_put32(dst, (uint32_t)dma);
++	mw_put32(dst + 4, (uint32_t)(dma >> 32) | (length << 16) |
++	    (barrier_read ? 1u << 13 : 0));
++	mw_put32(dst + 8, metadata); mw_put32(dst + 12, 0);
++	return 16;
++}
++#endif
+--- /dev/null
++++ b/bsd/dev/metroid_wifi_qrtr.h
+@@ -0,0 +1,34 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ * QRTR name-service wire subset, from Linux uapi/linux/qrtr.h and Nothing
++ * ICNSS2 WLFW lookup (service0x45, version1, instance3).
++ * Caller includes metroid_wifi_wire.h. Socket/GLINK framing is transport-owned.
++ */
++#ifndef METROID_WIFI_QRTR_H
++#define METROID_WIFI_QRTR_H
++#define MW_QRTR_CTRL 0xfffffffeu
++#define MW_QRTR_BCAST 0xffffffffu
++#define MW_WLFW_SERVICE 0x45u
++#define MW_WLFW_INSTANCE 0x301u
++struct mw_qrtr_peer { uint32_t node, port; };
++
++static inline int mw_qrtr_lookup(uint8_t *p, size_t n)
++{
++	if (!p || n < 20) return MW_INVALID;
++	mw_put32(p, 10); mw_put32(p + 4, MW_WLFW_SERVICE);
++	mw_put32(p + 8, MW_WLFW_INSTANCE); mw_put32(p + 12, 0); mw_put32(p + 16, 0);
++	return 20;
++}
++/* Call only for a datagram from the local QRTR control endpoint. Return1 for
++ * a matching announcement,0 for unrelated data,-1 for malformed control data.
++ */
++static inline int mw_qrtr_server(const uint8_t *p, size_t n, struct mw_qrtr_peer *peer)
++{
++	if (!p || !peer || n != 20) return MW_INVALID;
++	if (mw_le32(p) != 4 || mw_le32(p + 4) != MW_WLFW_SERVICE ||
++	    mw_le32(p + 8) != MW_WLFW_INSTANCE) return 0;
++	uint32_t node = mw_le32(p + 12), port = mw_le32(p + 16);
++	if (!node || node >= MW_QRTR_CTRL || !port || port >= MW_QRTR_CTRL)
++		return MW_INVALID;
++	peer->node = node; peer->port = port; return 1;
++}
++#endif
+--- /dev/null
++++ b/bsd/dev/metroid_wifi_smem.h
+@@ -0,0 +1,141 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ * Read-only Qualcomm SMEM v12 private-partition lookup. Layout reference:
++ * NothingOSS 031e8669 drivers/soc/qcom/smem.c. No allocation or remote locks;
++ * consume an immutable snapshot, never live headers while they can change.
++ * Caller includes metroid_wifi_wire.h first.
++ */
++#ifndef METROID_WIFI_SMEM_H
++#define METROID_WIFI_SMEM_H
++struct mw_smem_item { size_t offset, size; };
++struct mw_smem_partition { size_t offset, size; uint32_t cacheline; };
++
++static inline bool mw_span(size_t extent, size_t off, size_t len)
++{ return off <= extent && len <= extent - off; }
++static inline bool mw_power2(uint32_t n) { return n && !(n & (n - 1)); }
++
++static inline int
++mw_smem_locate(const uint8_t *p, size_t n, uint16_t remote, struct mw_smem_partition *out)
++{
++	struct mw_smem_partition found = {0};
++	if (!p || !out || n < 0x3000 || n > 0x1000000 || !remote || remote >= 20)
++		return MW_INVALID;
++	/* initialized and SBL's major-version field, as checked by Linux. */
++	if (mw_le32(p + 192) != 1 || mw_le32(p + 204) != 0 ||
++	    (mw_le32(p + 64 + 7 * 4) >> 16) != 12)
++		return MW_UNSUPPORTED;
++	size_t table = n - 4096;
++	const uint8_t *t = p + table;
++	if (mw_le32(t) != 0x434f5424 || mw_le32(t + 4) != 1) return MW_INVALID;
++	uint32_t count = mw_le32(t + 8);
++	if (count > (4096 - 32) / 48) return MW_INVALID;
++	for (unsigned i = 0; i < count; i++) {
++		const uint8_t *e = t + 32 + (size_t)i * 48;
++		uint16_t a = mw_le16(e + 12), b = mw_le16(e + 14);
++		if (!((a == 0 && b == remote) || (b == 0 && a == remote))) continue;
++		if (found.size) return MW_INVALID;
++		size_t off = mw_le32(e), size = mw_le32(e + 4);
++		uint32_t cacheline = mw_le32(e + 16);
++		/* No overlap with the global header or the partition table. */
++		if (off < 0x1000 || (off & 7) || size < 32 || (size & 7) ||
++		    !mw_span(table, off, size) || !mw_power2(cacheline) ||
++		    cacheline < 16 || cacheline > 4096 || size < cacheline) return MW_INVALID;
++		found.offset = off; found.size = size; found.cacheline = cacheline;
++	}
++	if (!found.size) return MW_NOT_FOUND;
++	*out = found; return MW_OK;
++}
++
++static inline int
++mw_smem_partition(const uint8_t *p, size_t n, uint16_t remote, struct mw_smem_partition *out)
++{
++	struct mw_smem_partition part;
++	int r = mw_smem_locate(p, n, remote, &part);
++	if (r || !out) return r ? r : MW_INVALID;
++	const uint8_t *h = p + part.offset;
++	uint16_t a = mw_le16(h + 4), b = mw_le16(h + 6);
++	if (mw_le32(h) != 0x54525024 || !((a == 0 && b == remote) ||
++	    (b == 0 && a == remote)) || mw_le32(h + 8) != part.size) return MW_INVALID;
++	size_t u = mw_le32(h + 12), c = mw_le32(h + 16);
++	if (u < 32 || u > c || c > part.size || (u & 7) || (c & 7)) return MW_INVALID;
++	*out = part; return MW_OK;
++}
++
++static inline int
++mw_smem_find(const uint8_t *p, size_t n, const struct mw_smem_partition *part,
++    uint16_t item, struct mw_smem_item *out)
++{
++	struct mw_smem_item found = {0};
++	if (!p || !part || !out || !mw_span(n, part->offset, part->size) ||
++	    part->size < 32 || !mw_power2(part->cacheline) ||
++	    part->cacheline < 16 || part->cacheline > 4096) return MW_INVALID;
++	const uint8_t *h = p + part->offset;
++	size_t u = mw_le32(h + 12), c = mw_le32(h + 16);
++	if (u < 32 || u > c || c > part->size) return MW_INVALID;
++	/* Uncached allocation: header, header padding, data including tail padding. */
++	for (size_t off = 32; off < u;) {
++		if (!mw_span(u, off, 16)) return MW_INVALID;
++		const uint8_t *e = h + off;
++		size_t size = mw_le32(e + 4), pad = mw_le16(e + 8), hp = mw_le16(e + 10);
++		if (mw_le16(e) != 0xa5a5 || !size || pad >= size ||
++		    !mw_span(u, off + 16, hp) || !mw_span(u, off + 16 + hp, size))
++			return MW_INVALID;
++		if (mw_le16(e + 2) == item) {
++			if (found.size) return MW_INVALID;
++			found.offset = part->offset + off + 16 + hp; found.size = size - pad;
++		}
++		off += 16 + hp + size;
++	}
++	/* Cached headers are aligned at the end, with data immediately before them. */
++	size_t align = part->cacheline;
++	if (c != part->size) {
++		if (part->size < align) return MW_INVALID;
++		size_t off = part->size - align;
++		while (off > c) {
++			if (!mw_span(part->size, off, 16) || off < c) return MW_INVALID;
++			const uint8_t *e = h + off;
++			size_t size = mw_le32(e + 4), pad = mw_le16(e + 8);
++			if (mw_le16(e) != 0xa5a5 || !size || pad >= size || size > off - c)
++				return MW_INVALID;
++			if (mw_le16(e + 2) == item) {
++				if (found.size) return MW_INVALID;
++				found.offset = part->offset + off - size; found.size = size - pad;
++			}
++			if (size > off || align > off - size) return MW_INVALID;
++			off -= size + align;
++			/* Linux's final header position may lie below cached data boundary. */
++		}
++	}
++	if (!found.size) return MW_NOT_FOUND;
++	*out = found; return MW_OK;
++}
++
++/* Linux GLINK SMEM items: descriptor478 (32 bytes), TX479 and RX480.
++ * Do not change pointers or consume a ring: ownership is not established.
++ */
++struct mw_glink_snapshot {
++	struct mw_smem_item descriptor, tx, rx;
++	uint32_t tx_tail, tx_head, rx_tail, rx_head;
++};
++static inline int
++mw_smem_glink(const uint8_t *p, size_t n, uint16_t remote, struct mw_glink_snapshot *out)
++{
++	struct mw_smem_partition part;
++	struct mw_glink_snapshot g = {0};
++	int r = mw_smem_partition(p, n, remote, &part);
++	if (r) return r;
++	if (!out) return MW_INVALID;
++	if ((r = mw_smem_find(p, n, &part, 478, &g.descriptor)) ||
++	    (r = mw_smem_find(p, n, &part, 479, &g.tx)) ||
++	    (r = mw_smem_find(p, n, &part, 480, &g.rx))) return r;
++	if (g.descriptor.size != 32 || g.tx.size < 32 || g.rx.size < 32 ||
++	    g.tx.size > 65536 || g.rx.size > 65536 || (g.tx.size & 7) || (g.rx.size & 7))
++		return MW_INVALID;
++	const uint8_t *d = p + g.descriptor.offset;
++	g.tx_tail = mw_le32(d); g.tx_head = mw_le32(d + 4);
++	g.rx_tail = mw_le32(d + 8); g.rx_head = mw_le32(d + 12);
++	if (g.tx_tail >= g.tx.size || g.tx_head >= g.tx.size ||
++	    g.rx_tail >= g.rx.size || g.rx_head >= g.rx.size ||
++	    ((g.tx_tail | g.tx_head | g.rx_tail | g.rx_head) & 7)) return MW_INVALID;
++	*out = g; return MW_OK;
++}
++#endif
+--- /dev/null
++++ b/bsd/dev/metroid_wifi_wire.h
+@@ -0,0 +1,146 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ * WCN7750 WLFW discovery subset. Wire definitions checked against NothingOSS
++ * 031e8669 vendor/qcom/opensource/wlan/platform/cnss_utils/
++ * wlan_firmware_service_v01.{c,h}. No packed structs or unaligned loads.
++ * Caller supplies uint*_t, size_t and bool definitions.
++ */
++#ifndef METROID_WIFI_WIRE_H
++#define METROID_WIFI_WIRE_H
++
++#define MW_QMI_CAP 0x0024u
++#define MW_QMI_DEVICE_INFO 0x004cu
++#define MW_QMI_HEADER 7u
++#define MW_QMI_MAX 8192u
++
++static inline uint16_t mw_le16(const uint8_t *p)
++{ return (uint16_t)(p[0] | ((uint16_t)p[1] << 8)); }
++static inline uint32_t mw_le32(const uint8_t *p)
++{ return (uint32_t)mw_le16(p) | ((uint32_t)mw_le16(p + 2) << 16); }
++static inline uint64_t mw_le64(const uint8_t *p)
++{ return (uint64_t)mw_le32(p) | ((uint64_t)mw_le32(p + 4) << 32); }
++static inline void mw_put16(uint8_t *p, uint16_t v)
++{ p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
++static inline void mw_put32(uint8_t *p, uint32_t v)
++{ mw_put16(p, (uint16_t)v); mw_put16(p + 2, (uint16_t)(v >> 16)); }
++
++enum mw_result {
++	MW_OK = 0, MW_INVALID = -1, MW_REMOTE_ERROR = -2,
++	MW_NOT_FOUND = -3, MW_UNSUPPORTED = -4, MW_STALE = -5
++};
++struct mw_caps {
++	uint32_t chip, family, board, soc;
++	unsigned valid; /* bit0 chip/family, bit1 board, bit2 SoC */
++};
++struct mw_device_info { uint64_t bar; uint32_t size; };
++
++/* Empty CAP and DEVICE_INFO requests, inside QRTR data (not QMUX). */
++static inline int
++mw_qmi_request(uint8_t *dst, size_t capacity, uint16_t txid, uint16_t message)
++{
++	if (!dst || capacity < MW_QMI_HEADER || !txid ||
++	    (message != MW_QMI_CAP && message != MW_QMI_DEVICE_INFO)) return MW_INVALID;
++	dst[0] = 0; mw_put16(dst + 1, txid); mw_put16(dst + 3, message);
++	mw_put16(dst + 5, 0);
++	return MW_QMI_HEADER;
++}
++
++/* Full TLV stream validation precedes publication. Unknown tags are skipped;
++ * duplicates (including unknown tags) and truncated fields are rejected.
++ */
++static inline int
++mw_qmi_response(const uint8_t *p, size_t n, uint16_t txid, uint16_t message,
++    struct mw_caps *caps, struct mw_device_info *info)
++{
++	struct mw_caps c = {0};
++	struct mw_device_info d = {0};
++	uint32_t seen[8] = {0};
++	bool result = false, address = false, size = false, remote_error = false;
++	if (!p || n < MW_QMI_HEADER || n > MW_QMI_MAX || !txid ||
++	    (message != MW_QMI_CAP && message != MW_QMI_DEVICE_INFO)) return MW_INVALID;
++	if (p[0] != 2 || mw_le16(p + 1) != txid || mw_le16(p + 3) != message)
++		return MW_STALE;
++	if ((size_t)mw_le16(p + 5) != n - MW_QMI_HEADER) return MW_INVALID;
++	for (size_t off = MW_QMI_HEADER; off < n;) {
++		if (n - off < 3) return MW_INVALID;
++		unsigned tag = p[off], len = mw_le16(p + off + 1);
++		uint32_t bit = 1u << (tag & 31);
++		if (seen[tag >> 5] & bit) return MW_INVALID;
++		seen[tag >> 5] |= bit;
++		off += 3;
++		if (len > n - off) return MW_INVALID;
++		const uint8_t *v = p + off;
++		if (tag == 2) {
++			if (len != 4) return MW_INVALID;
++			result = true;
++			remote_error = mw_le16(v) != 0 || mw_le16(v + 2) != 0;
++		} else if (message == MW_QMI_CAP) {
++			if (tag == 0x10) {
++				if (len != 8) return MW_INVALID;
++				c.chip = mw_le32(v); c.family = mw_le32(v + 4); c.valid |= 1;
++			} else if (tag == 0x11) {
++				if (len != 4) return MW_INVALID;
++				c.board = mw_le32(v); c.valid |= 2;
++			} else if (tag == 0x12) {
++				if (len != 4) return MW_INVALID;
++				c.soc = mw_le32(v); c.valid |= 4;
++			}
++		} else if (tag == 0x10) {
++			if (len != 8) return MW_INVALID;
++			d.bar = mw_le64(v); address = true;
++		} else if (tag == 0x11) {
++			if (len != 4) return MW_INVALID;
++			d.size = mw_le32(v); size = true;
++		}
++		off += len;
++	}
++	if (!result) return MW_INVALID;
++	if (remote_error) return MW_REMOTE_ERROR;
++	if (message == MW_QMI_CAP) {
++		if (!caps) return MW_INVALID;
++		*caps = c;
++	} else {
++		/* Syntax/size validation only: this does NOT authorize mapping the BAR.
++		 * Platform code must independently establish ownership/accessibility.
++		 */
++		if (!info || !address || !size || !d.bar || (d.bar & 0xfffu) ||
++		    d.size < 0x200000u || d.size > 0x4000000u || (d.size & 0xfffu) ||
++		    d.bar >= (1ull << 40) || d.size > (1ull << 40) - d.bar) return MW_INVALID;
++		*info = d;
++	}
++	return MW_OK;
++}
++
++/* One outstanding discovery request; transport owns QRTR/GLINK and timeouts.
++ * No retries with reused transaction IDs. Call reset only on a new transport
++ * epoch that cannot receive replies from the previous epoch.
++ */
++enum mw_discovery_phase { MW_DISC_CAP, MW_DISC_DEVICE, MW_DISC_DONE, MW_DISC_FAILED };
++struct mw_discovery {
++	enum mw_discovery_phase phase;
++	uint16_t txid;
++	struct mw_caps caps;
++	struct mw_device_info device;
++};
++static inline void mw_discovery_reset(struct mw_discovery *s)
++{
++	struct mw_discovery initial = {0};
++	*s = initial; s->phase = MW_DISC_CAP; s->txid = 1;
++}
++static inline int mw_discovery_request(const struct mw_discovery *s, uint8_t *p, size_t n)
++{
++	if (s->phase != MW_DISC_CAP && s->phase != MW_DISC_DEVICE) return MW_INVALID;
++	return mw_qmi_request(p, n, s->txid,
++	    s->phase == MW_DISC_CAP ? MW_QMI_CAP : MW_QMI_DEVICE_INFO);
++}
++static inline int mw_discovery_receive(struct mw_discovery *s, const uint8_t *p, size_t n)
++{
++	if (s->phase != MW_DISC_CAP && s->phase != MW_DISC_DEVICE) return MW_STALE;
++	int r = mw_qmi_response(p, n, s->txid,
++	    s->phase == MW_DISC_CAP ? MW_QMI_CAP : MW_QMI_DEVICE_INFO, &s->caps, &s->device);
++	if (r == MW_STALE) return r;
++	if (r) { s->phase = MW_DISC_FAILED; return r; }
++	if (s->phase == MW_DISC_CAP) { s->phase = MW_DISC_DEVICE; s->txid++; }
++	else s->phase = MW_DISC_DONE;
++	return MW_OK;
++}
++#endif

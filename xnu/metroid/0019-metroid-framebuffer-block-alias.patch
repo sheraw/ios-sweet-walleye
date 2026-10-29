@@ -1,0 +1,60 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1833,34 +1833,26 @@ arm_vm_physmap_slide(uint64_t physmap_slide)
+  */
+ #define SWEET_EARLY_FB_VA (VM_MIN_KERNEL_ADDRESS + ARM_TT_L2_SIZE)
+ 
+-/* Two private L3 tables in kernel BSS; not allocator-owned. The 64MB gap
+- * below gVirtBase contains only the splash pages and 192KB of display MMIO.
+- * No cacheable aliases to firmware reservations are introduced. */
+-static pt_entry_t metroid_console_pt[2][ARM_PGBYTES / sizeof(pt_entry_t)]
+-    __attribute__((aligned(ARM_PGBYTES)));
++/* Keep the final framebuffer alias identical to the bootstrap mapping shape:
++ * two Normal-NC 32MB blocks covering PA 0xfc000000..0xffffffff. The active
++ * scanout is 0xfc800000..0xff300000; the surrounding reservation is mapped
++ * but never accessed. Display MMIO is not needed after pipe discovery. */
+ static void
+ sweet_early_map_final(void)
+ {
+     const vm_map_address_t va = SWEET_EARLY_FB_VA;
+     assert(va + 2 * ARM_TT_L2_SIZE <= gVirtBase);
+     tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
+     assert((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
+     tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+     for (unsigned block = 0; block < 2; block++) {
+-        for (unsigned page = 0; page < ARM_PGBYTES / sizeof(pt_entry_t); page++) {
+-            uint64_t offset = block * ARM_TT_L2_SIZE + page * ARM_PGBYTES;
+-            uint64_t pa = 0xfc000000ULL + offset;
+-            unsigned attr = CACHE_ATTRINDX_WRITECOMB;
+-            if (offset < 0x30000) { pa = 0x0ae00000 + offset; attr = CACHE_ATTRINDX_DISABLE; }
+-            else if (pa < 0xfc800000 || pa >= 0xff300000) continue;
+-            metroid_console_pt[block][page] = pa | ARM_PTE_TYPE_VALID |
+-                ARM_PTE_SH(SH_OUTER_MEMORY) | ARM_PTE_ATTRINDX(attr) |
+-                ARM_PTE_AF | ARM_PTE_PNX | ARM_PTE_NX;
+-        }
+         tt_entry_t *slot = &l2[((va + block * ARM_TT_L2_SIZE) & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+         assert(*slot == ARM_TTE_EMPTY);
+-        uint64_t pa = (uint64_t)metroid_console_pt[block] - gVirtBase + gPhysBase;
+-        *slot = pa | ARM_TTE_VALID | ARM_TTE_TYPE_TABLE;
++        uint64_t pa = 0xfc000000ULL + block * ARM_TT_L2_SIZE;
++        *slot = pa | ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID |
++            ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
++            ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
++            ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+     }
+     __asm__ volatile("dsb ishst" ::: "memory");
+ }
+diff --git a/osfmk/arm64/metroid_console.c b/osfmk/arm64/metroid_console.c
+--- a/osfmk/arm64/metroid_console.c
++++ b/osfmk/arm64/metroid_console.c
+@@ -207,7 +207,8 @@ void metroid_console_string(const char *s) { while (*s) metroid_console_putc(*s++); }
+ void metroid_console_relocate(uint64_t base)
+ {
+     fb_bias = base - 0xfc000000ULL;
+-    mdp = (uintptr_t)base;
++    /* The permanent alias contains framebuffer RAM only. MDP discovery is
++     * complete and the post-VM path performs no display-register access. */
+     barrier();
+ }
+ const struct surface *metroid_console_surface(void) { return count ? surfaces : (void *)0; }

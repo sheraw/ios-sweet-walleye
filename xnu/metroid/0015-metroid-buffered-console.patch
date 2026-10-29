@@ -1,0 +1,187 @@
+diff --git a/osfmk/arm64/metroid_console.c b/osfmk/arm64/metroid_console.c
+--- a/osfmk/arm64/metroid_console.c
++++ b/osfmk/arm64/metroid_console.c
+@@ -13,11 +13,25 @@
+ static uint64_t fb_bias;
+ static struct surface surfaces[28];
+ static unsigned count, controllers, row, col, cols;
++static char pending[78];
+ static const uint32_t pipe_offsets[] = {0x5000,0x7000,0x25000,0x27000,0x29000,0x2b000,0x2d000};
+ static const uint32_t pipe_bits[] = {16,17,0,1,2,3,4};
+ #define SPLASH_START 0xfc800000ULL
+ #define SPLASH_END 0xff300000ULL
++#ifdef HOST_TEST
++uint32_t metroid_test_read(uintptr_t a);
++void metroid_test_write(uintptr_t a, uint32_t v);
++volatile uint32_t *metroid_test_fb(uint64_t a);
++#define rd metroid_test_read
++#define wr metroid_test_write
++#define fb_pointer metroid_test_fb
++#define barrier() ((void)0)
++#else
+ static uint32_t rd(uintptr_t a) { return *(volatile uint32_t *)a; }
++static void wr(uintptr_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
++static volatile uint32_t *fb_pointer(uint64_t a) { return (void *)(uintptr_t)a; }
++#define barrier() __asm__ volatile("dsb sy" ::: "memory")
++#endif
+ static int surface_decode(struct surface *s, uint32_t address, uint32_t size,
+                    uint32_t xy, uint32_t stride, uint32_t format,
+                    uint32_t unpack, uint32_t opmode, uint32_t secure,
+@@ -72,8 +86,15 @@
+             if (!surface_decode(&s, rd(pipe+0x14), rd(pipe), rd(pipe+8),
+                 rd(pipe+0x24), rd(pipe+0x30), rd(pipe+0x34), rd(pipe+0x38),
+                 rd(pipe+0x70), rd(pipe+0x170))) continue;
+-            surfaces[count++] = s;
+-            if (s.width / 16 < cols) cols = s.width / 16;
++            /* A split/mirrored controller may reference the same pipe. */
++            unsigned duplicate = 0;
++            for (unsigned i = 0; i < count; i++)
++                if (surfaces[i].address == s.address && surfaces[i].x == s.x &&
++                    surfaces[i].stride == s.stride && surfaces[i].width == s.width)
++                    duplicate = 1;
++            if (!duplicate) surfaces[count++] = s;
++            unsigned available = (1260 - 32) / 16;
++            if (available < cols) cols = available;
+             controllers |= 1u << c;
+         }
+     }
+@@ -87,7 +108,7 @@
+             for (uint32_t y = 0; y < s.height; y++) {
+                 volatile uint32_t *line = fb + (uint64_t)y * pitch;
+                 for (uint32_t x = 0; x < s.width; x++) {
+-                    line[x] = s.black;
++                    line[s.x + x] = s.black;
+                 }
+             }
+         }
+@@ -95,56 +116,99 @@
+ 
+     return count != 0;
+ }
+-static void refresh(void)
+-{
+-    __asm__ volatile("dsb sy" ::: "memory");
++void metroid_console_refresh(void)
++{
++    barrier();
+     for (unsigned c = 0; c < 4; c++)
+         if (controllers & (1u << c))
+-            *(volatile uint32_t *)(mdp + 0x1601c + c * 0x1000) = 1;
+-    __asm__ volatile("dsb sy" ::: "memory");
++            wr(mdp + 0x1601c + c * 0x1000, 1);
++    barrier();
++ #ifndef HOST_TEST
+     uint64_t start, now, hz;
+     __asm__ volatile("mrs %0, cntpct_el0" : "=r"(start));
+     __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(hz));
+     do { __asm__ volatile("mrs %0, cntpct_el0" : "=r"(now)); }
+     while (now - start < hz / 10);
++ #endif
++}
++/* Render a completed row surface-by-surface, like the working probe. All
++ * layout/cursor values are snapshots: framebuffer stores cannot force the
++ * compiler to reload them from uncached RAM for every pixel. */
++static void commit_line(void)
++{
++    const unsigned line_row = row, length = col, line_cols = cols;
++    const unsigned n = count;
++    const uint64_t bias = fb_bias;
++
++    for (unsigned p = 0; p < n; p++) {
++        const struct surface surface = surfaces[p];
++        volatile uint32_t *fb = fb_pointer(surface.address + bias);
++        const unsigned pitch = surface.stride / 4;
++        for (unsigned gy = 0; gy < 16; gy++) {
++            for (unsigned sy = 0; sy < 2; sy++) {
++                uint64_t row_base_offset = (uint64_t)(160 + line_row * 32 + gy * 2 + sy) * pitch;
++
++                for (unsigned column = 0; column < line_cols; column++) {
++                    unsigned screen_x = 16 + column * 16;
++
++                    /* Split-pipe horizontal boundary clipping */
++                    if (screen_x + 16 <= surface.x || screen_x >= surface.x + surface.width) {
++                        continue;
++                    }
++                    /* surface.address is the shared buffer base; x is absolute. */
++                    unsigned local_x = screen_x;
++                    volatile uint32_t *dst = fb + row_base_offset + local_x;
++
++                    unsigned c = column < length ? (unsigned char)pending[column] : ' ';
++#ifdef METROID_XNU
++                    unsigned bits = iso_font[c * 16 + gy];
++#else
++                    unsigned bits = font8x16[c - 32][gy];
++#endif
++                    for (unsigned gx = 0; gx < 8; gx++) {
++#ifdef METROID_XNU
++                        unsigned ink = bits & (1u << gx);
++#else
++                        unsigned ink = bits & (0x80u >> gx);
++#endif
++                        uint32_t pixel = ink ? 0xffffffffu : surface.black;
++                        for (unsigned sx = 0; sx < 2; sx++) {
++                            unsigned x = screen_x + gx * 2 + sx;
++                            if (x >= surface.x && x < surface.x + surface.width)
++                                dst[gx * 2 + sx] = pixel;
++                        }
++                    }
++                }
++            }
++        }
++    }
++    // metroid_console_refresh();
++    col = 0;
++    row = (line_row + 1) % 70;
+ }
+ void metroid_console_putc(char ch)
+ {
+     if (!count) return;
+     if (ch == '\r') { col = 0; return; }
+-    if (ch == '\n' || col == cols) {
+-        refresh(); col = 0; row = (row + 1) % 70;
+-        if (ch == '\n') return;
+-    }
++    if (ch == '\n') { commit_line(); return; }
++    if (col == cols) commit_line();
+     unsigned c = (unsigned char)ch;
+     if (c < 32 || c > 126) c = '?';
+-    for (unsigned p = 0; p < count; p++) {
+-        const struct surface *s = &surfaces[p];
+-        volatile uint32_t *fb = (void *)(uintptr_t)(s->address + fb_bias);
+-        if (!col) {
+-            for (unsigned y = 0; y < 32; y++)
+-                for (unsigned x = 0; x < s->width; x++)
+-                    fb[(uint64_t)(160 + row*32 + y)* (s->stride/4) + s->x+x] = s->black;
+-        }
+-        for (unsigned gy = 0; gy < 16; gy++)
+-            for (unsigned gx = 0; gx < 8; gx++) {
+-#ifdef METROID_XNU
+-                unsigned ink = iso_font[c*16+gy] & (1u << gx);
+-#else
+-                unsigned ink = font8x16[c-32][gy] & (0x80u >> gx);
+-#endif
+-                for (unsigned sy = 0; sy < 2; sy++)
+-                    for (unsigned sx = 0; sx < 2; sx++)
+-                        fb[(uint64_t)(160+row*32+gy*2+sy)*(s->stride/4)+s->x+col*16+gx*2+sx] = ink ? 0xffffffffu : s->black;
+-            }
+-    }
+-    col++;
++    pending[col++] = (char)c;
+ }
+ void metroid_console_string(const char *s) { while (*s) metroid_console_putc(*s++); }
+ void metroid_console_relocate(uint64_t base)
+ {
+     fb_bias = base - 0xfc000000ULL;
+     mdp = (uintptr_t)base;
+-    __asm__ volatile("dsb sy; isb" ::: "memory");
++    barrier();
+ }
+ const struct surface *metroid_console_surface(void) { return count ? surfaces : (void *)0; }
++
++void metroid_console_hex(const char *label, uint64_t value)
++{
++    metroid_console_string(label);
++    for (int shift = 60; shift >= 0; shift -= 4)
++        metroid_console_putc("0123456789ABCDEF"[(value >> shift) & 15]);
++    metroid_console_putc('\n');
++}

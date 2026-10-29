@@ -1,0 +1,370 @@
+diff --git a/osfmk/arm64/metroid_console.c b/osfmk/arm64/metroid_console.c
+--- a/osfmk/arm64/metroid_console.c
++++ b/osfmk/arm64/metroid_console.c
+@@ -1,7 +1,7 @@
+ #define METROID_XNU 1
+ /* Command-mode console using the firmware's validated, active linear pipes.
+  * Never changes display routing, buffer addresses, clocks, DSC or power.
+- * Single CPU, no allocator/locks. Refreshes on newline with a bounded delay.
++ * Single CPU, no allocator/locks. Never waits on display hardware.
+  */
+ #include "metroid_console.h"
+ #ifdef METROID_XNU
+@@ -12,7 +12,11 @@
+ static uintptr_t mdp = 0x0ae00000;
+ static uint64_t fb_bias;
+ static struct surface surfaces[28];
+-static unsigned count, controllers, row, col, cols;
++static unsigned count, row, col, cols, used, initialized, dirty;
++/* Diagnostic ring, available by symbol in a debugger/dump even without video.
++ * Single boot CPU only; output serialization is provided by XNU after startup. */
++char metroid_console_log[65536];
++uint64_t metroid_console_log_count;
+ static char pending[78];
+ static const uint32_t pipe_offsets[] = {0x5000,0x7000,0x25000,0x27000,0x29000,0x2b000,0x2d000};
+ static const uint32_t pipe_bits[] = {16,17,0,1,2,3,4};
+@@ -20,15 +24,12 @@
+ #define SPLASH_END 0xff300000ULL
+ #ifdef HOST_TEST
+ uint32_t metroid_test_read(uintptr_t a);
+-void metroid_test_write(uintptr_t a, uint32_t v);
+ volatile uint32_t *metroid_test_fb(uint64_t a);
+ #define rd metroid_test_read
+-#define wr metroid_test_write
+ #define fb_pointer metroid_test_fb
+ #define barrier() ((void)0)
+ #else
+ static uint32_t rd(uintptr_t a) { return *(volatile uint32_t *)a; }
+-static void wr(uintptr_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
+ static volatile uint32_t *fb_pointer(uint64_t a) { return (void *)(uintptr_t)a; }
+ #define barrier() __asm__ volatile("dsb sy" ::: "memory")
+ #endif
+@@ -72,7 +73,9 @@
+ 
+ int metroid_console_init(void)
+ {
+-    count = controllers = row = col = 0; cols = 78;
++    if (initialized) return count != 0;
++    initialized = 1;
++    count = row = col = used = dirty = 0; cols = 78;
+     for (unsigned c = 0; c < 4; c++) {
+         uintptr_t ctl = mdp + 0x16000 + c * 0x1000;
+         uint32_t intf = rd(ctl + 0xf4);
+@@ -95,7 +98,6 @@
+             if (!duplicate) surfaces[count++] = s;
+             unsigned available = (1260 - 32) / 16;
+             if (available < cols) cols = available;
+-            controllers |= 1u << c;
+         }
+     }
+ 
+@@ -116,30 +118,47 @@
+ 
+     return count != 0;
+ }
+-void metroid_console_refresh(void)
+-{
+-    barrier();
+-    for (unsigned c = 0; c < 4; c++)
+-        if (controllers & (1u << c))
+-            wr(mdp + 0x1601c + c * 0x1000, 1);
+-    barrier();
+- #ifndef HOST_TEST
+-    uint64_t start, now, hz;
+-    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(start));
+-    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(hz));
+-    do { __asm__ volatile("mrs %0, cntpct_el0" : "=r"(now)); }
+-    while (now - start < hz / 10);
+- #endif
+-}
++/* Firmware scanout is preserved. Explicit CTL_START/timer waits caused the
++ * observed boot stall; no display register writes or polling in the log path.
++ * Bootstrap and permanent framebuffer mappings are both Normal-NC. */
++void metroid_console_refresh(void) { barrier(); }
++int metroid_console_ready(void) { return count != 0; }
++/* Expose ABL's scanout only when all active pipes form one shared linear
++ * 1260x2800 framebuffer. This keeps the post-VM console from guessing. */
++int metroid_console_framebuffer(uint64_t *base, uint32_t *width,
++    uint32_t *height, uint32_t *stride)
++{
++    if (!count) return 0;
++    const struct surface first = surfaces[0];
++    uint32_t covered = 0;
++    for (uint32_t x = 0; x < 1260;) {
++        uint32_t end = x;
++        for (unsigned i = 0; i < count; i++) {
++            const struct surface s = surfaces[i];
++            if (s.address != first.address || s.stride != first.stride ||
++                s.height != first.height || s.y != 0) return 0;
++            if (s.x <= x && s.x + s.width > end) end = s.x + s.width;
++        }
++        if (end == x) return 0;
++        x = covered = end;
++    }
++    if (covered != 1260 || first.height != 2800 ||
++        first.stride < covered * 4) return 0;
++    *base = first.address; *width = covered; *height = first.height;
++    *stride = first.stride;
++    return 1;
++}
++
++
+ /* Render a completed row surface-by-surface, like the working probe. All
+  * layout/cursor values are snapshots: framebuffer stores cannot force the
+  * compiler to reload them from uncached RAM for every pixel. */
+-static void commit_line(void)
+-{
+-    const unsigned line_row = row, length = col, line_cols = cols;
++void metroid_console_flush(void)
++{
++    if (!count || !dirty) return;
++    const unsigned line_row = row, length = used, line_cols = cols;
+     const unsigned n = count;
+     const uint64_t bias = fb_bias;
+-
+     for (unsigned p = 0; p < n; p++) {
+         const struct surface surface = surfaces[p];
+         volatile uint32_t *fb = fb_pointer(surface.address + bias);
+@@ -182,19 +201,33 @@
+             }
+         }
+     }
+-    // metroid_console_refresh();
+-    col = 0;
+-    row = (line_row + 1) % 70;
++    barrier();
++    dirty = 0;
++}
++static void newline(void)
++{
++    dirty = 1;
++    metroid_console_flush();
++    col = used = 0;
++    row = (row + 1) % 70;
+ }
+ void metroid_console_putc(char ch)
+ {
++    metroid_console_log[metroid_console_log_count++ & 65535] = ch;
+     if (!count) return;
++    /* Preserve buffered length: both kprintf and printf emit CR before LF. */
+     if (ch == '\r') { col = 0; return; }
+-    if (ch == '\n') { commit_line(); return; }
+-    if (col == cols) commit_line();
+-    unsigned c = (unsigned char)ch;
+-    if (c < 32 || c > 126) c = '?';
+-    pending[col++] = (char)c;
++    if (ch == '\n') { newline(); return; }
++    if (ch == '\b') { if (col) col--; return; }
++    unsigned spaces = ch == '\t' ? 8 - (col & 7) : 1;
++    for (unsigned i = 0; i < spaces; i++) {
++        if (col == cols) newline();
++        unsigned c = ch == '\t' ? ' ' : (unsigned char)ch;
++        if (c < 32 || c > 126) c = '?';
++        pending[col++] = (char)c;
++        if (used < col) used = col;
++        dirty = 1;
++    }
+ }
+ void metroid_console_string(const char *s) { while (*s) metroid_console_putc(*s++); }
+ void metroid_console_relocate(uint64_t base)
+diff --git a/osfmk/arm64/metroid_console.h b/osfmk/arm64/metroid_console.h
+--- a/osfmk/arm64/metroid_console.h
++++ b/osfmk/arm64/metroid_console.h
+@@ -3,6 +3,9 @@
+ #include <stdint.h>
+ struct surface { uint64_t address; uint32_t width, height, stride, x, y, black; };
+ int metroid_console_init(void);
++int metroid_console_ready(void);
++int metroid_console_framebuffer(uint64_t *base, uint32_t *width, uint32_t *height, uint32_t *stride);
++void metroid_console_flush(void);
+ void metroid_console_putc(char c);
+ void metroid_console_string(const char *s);
+ void metroid_console_relocate(uint64_t base);
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -3,7 +3,21 @@
+ #include <kern/misc_protos.h>
+ #include "metroid_console.h"
+ static unsigned started, panicking;
+-void sweet_early_putc(char c) { metroid_console_putc(c); }
++void sweet_early_putc(char c)
++{
++    if (!started) { started = 1; metroid_console_init(); }
++    metroid_console_putc(c);
++}
++void sweet_early_flush(void) { metroid_console_flush(); }
++int sweet_early_ready(void) { return metroid_console_ready(); }
++static unsigned framebuffer_console;
++int sweet_early_owns_console(void) { return !framebuffer_console; }
++void sweet_early_framebuffer_console(void) { framebuffer_console = 1; }
++int sweet_early_framebuffer(uint64_t *base, uint32_t *width,
++    uint32_t *height, uint32_t *stride)
++{
++    return metroid_console_framebuffer(base, width, height, stride);
++}
+ void sweet_early_mark(unsigned stage, const char *label)
+ {
+     if (!started) { started = 1; metroid_console_init(); }
+diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -9,6 +9,11 @@
+ #if defined(SWEET)
+ void sweet_early_mark(unsigned int stage, const char *label);
+ void sweet_early_putc(char c);
++void sweet_early_flush(void);
++int sweet_early_ready(void);
++int sweet_early_owns_console(void);
++void sweet_early_framebuffer_console(void);
++int sweet_early_framebuffer(uint64_t *base, uint32_t *width, uint32_t *height, uint32_t *stride);
+ void sweet_early_panic(const char *fmt, va_list *args);
+ void sweet_early_relocate(uint64_t base);
+ void sweet_early_disable(void);
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -50,6 +50,7 @@
+ #if __arm64__
+ #include <machine/machine_routines.h>
+ #include <arm/cpu_data_internal.h>
++#include <arm64/sweet_early.h>
+ #endif
+ 
+ #ifdef CONFIG_XNUPOST
+@@ -245,6 +246,16 @@
+ static inline void
+ _cnputc(char c, bool poll)
+ {
++#if defined(SWEET)
++    /* The Metroid overlay owns the firmware scanout from first C entry.
++     * printf/panic output must not go to vcputc before serial_init completes. */
++    if (sweet_early_owns_console()) {
++        (void)poll;
++        sweet_early_putc(c);
++        return;
++    }
++#endif
++
+ 	bool in_debugger = (kernel_debugger_entry_count > 0);
+ 	const uint32_t idx = get_cons_ops_index();
+ 
+diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -8,6 +8,10 @@
+ #include <mach/vm_param.h>
+ #include <pexpert/protos.h>
+ #include <pexpert/pexpert.h>
++#include <arm64/sweet_early.h>
++#if defined(SWEET)
++extern int switch_to_video_console(void);
++#endif
+ #include <pexpert/boot.h>
+ #include <pexpert/device_tree.h>
+ #include <pexpert/pe_images.h>
+@@ -506,17 +510,44 @@
+ void
+ PE_create_console(void)
+ {
++#if defined(SWEET)
++    uint64_t base;
++    uint32_t width, height, stride;
++    if (!sweet_early_framebuffer(&base, &width, &height, &stride)) {
++        kprintf("METROID FB: non-linear live pipes; keeping early console\n");
++        return;
++    }
++    PE_state.video.v_baseAddr = base;
++    PE_state.video.v_rowBytes = stride;
++    PE_state.video.v_width = width;
++    PE_state.video.v_height = height;
++    PE_state.video.v_depth = 32;
++    PE_state.video.v_rotate = 0;
++    PE_state.video.v_scale = 1;
++    PE_state.video.v_display = 0; /* Native verbose text console. */
++    strlcpy(PE_state.video.v_pixelFormat, "BBBBBBBBGGGGGGGGRRRRRRRR",
++        sizeof(PE_state.video.v_pixelFormat));
++    kprintf("METROID FB: takeover %ux%u stride %u at 0x%llx\n",
++        width, height, stride, base);
++#endif
++
+ 	/*
+ 	 * Check the head of VRAM for a panic log saved on last panic.
+ 	 * Do this before the VRAM is trashed.
+ 	 */
++#if !defined(SWEET)
+ 	check_for_panic_log();
++#endif
+ 
+ 	if (PE_state.video.v_display) {
+ 		PE_initialize_console(&PE_state.video, kPEGraphicsMode);
+ 	} else {
+ 		PE_initialize_console(&PE_state.video, kPETextMode);
+ 	}
++#if defined(SWEET)
++	(void)switch_to_video_console();
++	sweet_early_framebuffer_console();
++#endif
+ }
+ 
+ int
+diff --git a/pexpert/arm/pe_kprintf.c b/pexpert/arm/pe_kprintf.c
+--- a/pexpert/arm/pe_kprintf.c
++++ b/pexpert/arm/pe_kprintf.c
+@@ -6,6 +6,8 @@
+  *    arm platform expert debugging output initialization.
+  */
+ #include <stdarg.h>
++#include <arm64/sweet_early.h>
++#include <pexpert/protos.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/debug.h>
+@@ -102,6 +104,18 @@
+ 	boolean_t       state;
+ 	void           *caller = __builtin_return_address(0);
+ 
++#if defined(SWEET)
++    /* Before STARTUP_KPRINTF neither the serial sink nor per-CPU locking is
++     * available. Preserve real boot messages through the same early console. */
++    if (PE_kputc == NULL) {
++        va_start(listp, fmt);
++        _doprnt(fmt, &listp, sweet_early_putc, 16);
++        va_end(listp);
++        sweet_early_flush();
++        return;
++    }
++#endif
++
+ 	if (!disable_serial_output && !disable_kprintf_output) {
+ 		va_start(listp, fmt);
+ 		va_copy(listp2, listp);
+@@ -122,6 +136,9 @@
+ 		}
+ 
+ 		_doprnt_log(fmt, &listp, PE_kputc, 16);
++#if defined(SWEET)
++        sweet_early_flush();
++#endif
+ 
+ 		simple_unlock(&kprintf_lock);
+ 
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -709,7 +709,14 @@
+     .transmit_data = metroid_tx, .receive_ready = metroid_rx_ready,
+     .receive_data = metroid_rx, .device = SERIAL_SWEET_FBCON
+ };
+-static void fbcon_probe(void) { register_serial_functions(&metroid_serial); }
++static void fbcon_probe(void)
++{
++    static bool registered;
++    if (!registered && sweet_early_ready()) {
++        register_serial_functions(&metroid_serial);
++        registered = true;
++    }
++}
+ 
+ #if HIBERNATION
+ /**

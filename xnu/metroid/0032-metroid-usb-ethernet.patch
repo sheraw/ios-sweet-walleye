@@ -1,0 +1,1451 @@
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -12,3 +12,4 @@
+ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
++iokit/Kernel/arm/MetroidUSBEthernet.cpp                          optional iokitcpp
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/metroid_touch.c			standard
+ bsd/dev/metroid_wifi.c			standard
++bsd/dev/metroid_usb.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -866,6 +866,8 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	extern void metroid_wifi_init(void);
+ 	metroid_wifi_init();
++	extern void metroid_usb_init(void);
++	metroid_usb_init();
+ #endif
+ #endif /* NETWORKING */
+ 
+--- /dev/null
++++ b/bsd/dev/metroid_usb.c
+@@ -0,0 +1,942 @@
++/* Metroid/Nothing Phone (3) CDC-ECM USB Ethernet.
++ * Reuses the repository's Redmi DWC3/ECM implementation (0072-0076,0081),
++ * adapted to Tuna clocks, inherited eUSB2 PHY and stream0x40 SMMUv2 DMA.
++ * No PHY/power reset, global SMMU reset, or phone storage writes.
++ * Hardware enumeration and app internet remain to be validated.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <kern/locks.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/kpi_socket.h>
++#include <sys/sockio.h>
++#include <net/if.h>
++#include <net/if_types.h>
++#include <net/ethernet.h>
++#include <net/if_ether.h>
++#include <net/ether_if_module.h>
++#include <net/kpi_interface.h>
++#include <net/kpi_protocol.h>
++#include <netinet/in.h>
++#include <net/if_media.h>
++#include <net/dlil.h>
++#include <sys/kern_event.h>
++#include "metroid_usb_protocol.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++void metroid_usb_init(void);
++extern void metroid_usb_iokit_publish(const uint8_t *mac);
++extern void metroid_usb_iokit_link(bool up);
++static void metroid_usb_gadget_start(vm_offset_t dwc);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++
++static uint32_t usb_rd(vm_offset_t base, uint32_t off) {
++ uint32_t v=*(volatile uint32_t *)(base+off);
++ __asm__ volatile("dmb oshld" ::: "memory"); return v;
++}
++static void usb_wr(vm_offset_t base, uint32_t off, uint32_t v) {
++ __asm__ volatile("dmb oshst" ::: "memory");
++ *(volatile uint32_t *)(base+off)=v;
++ __asm__ volatile("dsb osh" ::: "memory");
++}
++static uint64_t usb_now_us(void) {
++ uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(), &ns); return ns/NSEC_PER_USEC;
++}
++static void usb_probe(unsigned mode);
++void metroid_usb_init(void);
++/*
++ * Step 2: USB device mode with only the default control endpoint, enough
++ * for the host to enumerate the phone (boot-arg sweetusb=2). ABL leaves
++ * the DWC3 powered, clocked, in device mode and halted, with the PHY set
++ * up, so only the device controller is restarted: soft reset, an event
++ * buffer in our memory, endpoint 0, run. Events are polled from a kernel
++ * thread (no interrupt), like the UFS driver. DMA is not cache coherent
++ * (DT qcom,gsi-disable-io-coherency): buffers are cleaned/invalidated.
++ * Register layout and the control-transfer state machine follow the
++ * Synopsys DWC3 databook as used by Linux drivers/usb/dwc3 (gadget.c,
++ * ep0.c).
++ */
++#define GCTL            0xc110
++#define GEVNTADRLO      0xc400
++#define GEVNTADRHI      0xc404
++#define GEVNTSIZ        0xc408
++#define GEVNTCOUNT      0xc40c
++#define DCFG            0xc700
++#define DCTL            0xc704
++#define DEVTEN          0xc708
++#define DSTS            0xc70c
++#define DALEPENA        0xc720
++#define DEPCMDPAR2(n)   (0xc800 + 0x10 * (n))
++#define DEPCMDPAR1(n)   (0xc804 + 0x10 * (n))
++#define DEPCMDPAR0(n)   (0xc808 + 0x10 * (n))
++#define DEPCMD(n)       (0xc80c + 0x10 * (n))
++
++/*
++ * Qualcomm wrapper registers ("QSCRATCH", core base + 0xf8800). The
++ * controller only connects (pull-up on D+) while it sees a valid VBUS
++ * session; Linux dwc3-qcom forces that in software when the charger
++ * reports a cable (dwc3_qcom_vbus_override_enable).
++ */
++#define QSCRATCH_PA             0x0a6f8800
++#define QSCRATCH_HS_PHY_CTRL    0x10
++#define   UTMI_OTG_VBUS_VALID   (1u << 20)
++#define   SW_SESSVLD_SEL        (1u << 28)
++#define QSCRATCH_SS_PHY_CTRL    0x30
++#define   LANE0_PWR_PRESENT     (1u << 24)
++
++#define DCTL_RUN_STOP   (1u << 31)
++#define DCTL_CSFTRST    (1u << 30)
++#define DSTS_DEVCTRLHLT (1u << 22)
++
++#define DEPCMD_SETEPCONFIG      1
++#define DEPCMD_SETTRANSFRESOURCE 2
++#define DEPCMD_SETSTALL         4
++#define DEPCMD_STARTTRANSFER    6
++#define DEPCMD_DEPSTARTCFG      9
++#define DEPCMD_CMDACT           (1u << 10)
++
++#define TRB_HWO         (1u << 0)
++#define TRB_LST         (1u << 1)
++#define TRB_ISP_IMI     (1u << 10)
++#define TRB_IOC         (1u << 11)
++#define TRBCTL_SETUP    (2u << 4)
++#define TRBCTL_STATUS2  (3u << 4)
++#define TRBCTL_STATUS3  (4u << 4)
++#define TRBCTL_DATA     (5u << 4)
++
++/* DMA area layout */
++#define UD_EVT          0x0000          /* event buffer, 4 KiB */
++#define UD_EVT_SIZE     0x1000
++#define UD_TRB_OUT      0x1000          /* ep0 OUT TRB */
++#define UD_TRB_IN       0x1080          /* ep0 IN TRB */
++#define UD_TRB_RX       0x1100          /* ep1 OUT (bulk, host -> phone) */
++#define UD_TRB_TX       0x1180          /* ep1 IN (bulk, phone -> host) */
++#define UD_TRB_INT      0x1200          /* ep2 IN (interrupt, notifications) */
++#define UD_SETUP        0x1280          /* 8-byte setup packet */
++#define UD_DATA         0x1300          /* ep0 data stage, 512 bytes */
++#define UD_NOTIFY       0x1600          /* 16-byte notification */
++#define UD_RX           0x2000          /* one received frame */
++#define UD_TX           0x2800          /* one frame to send */
++#define UD_FRAME_MAX    0x800
++#define UD_SIZE         0x4000
++
++/* Physical endpoints: 2n = OUT, 2n+1 = IN */
++#define EP_RX           2               /* 0x01 bulk OUT */
++#define EP_TX           3               /* 0x81 bulk IN */
++#define EP_INT          5               /* 0x82 interrupt IN */
++#define TRBCTL_NORMAL   (1u << 4)
++
++#define UD_TXQ          32
++
++static struct {
++	vm_offset_t dwc;
++	vm_offset_t dma;
++	uint64_t    dma_bus;
++	uint32_t    evt_pos;
++	int         sleep_chan;
++	enum { EP0_SETUP, EP0_DATA, EP0_WAIT_STATUS2, EP0_WAIT_STATUS3, EP0_STATUS } state;
++	bool        data_in;        /* data stage direction */
++	uint32_t    events;
++	_Atomic(bool) configured;
++	_Atomic(uint8_t) data_alt;       /* data interface alternate setting */
++	/* network */
++	ifnet_t     ifp;
++	lck_mtx_t  *lock;           /* TX ring and TX endpoint */
++	mbuf_t      txq[UD_TXQ];
++	unsigned    txq_head, txq_count;
++	_Atomic(bool) dead;
++	bool        tx_busy;
++	uint64_t    rx_frames, tx_frames;
++} ud;
++
++extern void metroid_smmu_lock(void);
++extern void metroid_smmu_unlock(void);
++#include "metroid_usb_dma.h"
++static struct mu_domain usb_domain;
++static bool usb_dma_init(void);
++static bool usb_dma_fault(void);
++static inline void
++dwc_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(ud.dwc + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static inline uint32_t
++dwc_rd(uint32_t off)
++{
++	return usb_rd(ud.dwc, off);
++}
++
++static void
++ud_sync(uint32_t off, uint32_t len)
++{
++	if (off > UD_SIZE || len > UD_SIZE - off) { ud.dead = true; return; }
++	FlushPoC_DcacheRegion((vm_offset_t)(ud.dma + off), len);
++}
++
++static void
++ud_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&ud.sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static int
++ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
++{
++	if (ud.dead) return -1;
++	dwc_wr(DEPCMDPAR0(ep), p0);
++	dwc_wr(DEPCMDPAR1(ep), p1);
++	dwc_wr(DEPCMDPAR2(ep), p2);
++	dwc_wr(DEPCMD(ep), cmd | DEPCMD_CMDACT);
++	for (int i = 0; i < 1000; i++) {
++		uint32_t v = dwc_rd(DEPCMD(ep));
++		if (!(v & DEPCMD_CMDACT)) {
++			uint32_t status = (v >> 12) & 0xf;
++			if (status) {
++				printf("METROID USB: ep%u cmd 0x%x status %u\n", ep, cmd & 0xf, status);
++				ud.dead = true; return -1;
++			}
++			return 0;
++		}
++		delay(1);
++	}
++	printf("METROID USB: ep%u cmd 0x%x timeout\n", ep, cmd & 0xf);
++	ud.dead = true; return -1;
++}
++
++/* One TRB (at DMA offset trb) on physical endpoint ep. */
++static void
++ud_start_trb(unsigned ep, uint32_t trb, uint32_t buf, uint32_t len, uint32_t ctl)
++{
++	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + trb);
++	if (ud.dead || trb > UD_SIZE - 16 || buf > UD_SIZE || len > UD_SIZE - buf) { ud.dead = true; return; }
++	uint64_t bpa = ud.dma_bus + buf;
++	ud_sync(trb, 16);
++	if (t[3] & TRB_HWO) { ud.dead = true; return; }
++
++	t[0] = (uint32_t)bpa;
++	t[1] = (uint32_t)(bpa >> 32);
++	t[2] = len;
++	t[3] = ctl | TRB_HWO | TRB_LST | TRB_ISP_IMI | TRB_IOC;
++	ud_sync(trb, 16);
++	if (len) {
++		ud_sync(buf, len);
++	}
++	uint64_t tpa = ud.dma_bus + trb;
++	ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0);
++}
++
++static void
++ud_start(unsigned ep, uint32_t buf, uint32_t len, uint32_t ctl)
++{
++	ud_start_trb(ep, ep ? UD_TRB_IN : UD_TRB_OUT, buf, len, ctl);
++}
++
++static void
++ud_start_setup(void)
++{
++	ud.state = EP0_SETUP;
++	ud_start(0, UD_SETUP, 8, TRBCTL_SETUP);
++}
++
++static void
++ud_stall(void)
++{
++	ud_epcmd(0, DEPCMD_SETSTALL, 0, 0, 0);
++	ud_start_setup();
++}
++
++/*
++ * USB descriptors: a CDC-ECM (Ethernet) function, which Linux (cdc_ether)
++ * and macOS drive without extra drivers. VID 0x1209 / PID 0x0001 =
++ * pid.codes test ID, not a product.
++ */
++static const uint8_t ud_dev_desc[18] = {
++	18, 1, 0x00, 0x02, 0x02, 0x00, 0x00, 64,
++	0x09, 0x12, 0x01, 0x00, 0x00, 0x01, 1, 2, 3, 1,
++};
++static const uint8_t ud_cfg_desc[80] = {
++	9, 2, 80, 0, 2, 1, 0, 0x80, 250,                /* config: 2 interfaces, 500 mA */
++	9, 4, 0, 0, 1, 0x02, 0x06, 0x00, 0,             /* comm interface 0: CDC ECM, 1 endpoint */
++	5, 0x24, 0x00, 0x10, 0x01,                      /* header, CDC 1.10 */
++	5, 0x24, 0x06, 0, 1,                            /* union: control 0, data 1 */
++	13, 0x24, 0x0f, 4, 0, 0, 0, 0, 0xea, 0x05, 0, 0, 0, /* ethernet: MAC string 4, max segment 1514 */
++	7, 5, 0x82, 0x03, 16, 0, 9,                     /* ep 0x82 interrupt IN, 16 bytes, 2^(9-1) uframes */
++	9, 4, 1, 0, 0, 0x0a, 0x00, 0x00, 0,             /* data interface 1 alt 0: no endpoints */
++	9, 4, 1, 1, 2, 0x0a, 0x00, 0x00, 0,             /* data interface 1 alt 1: two bulk endpoints */
++	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                /* ep 0x81 bulk IN, 512 */
++	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                /* ep 0x01 bulk OUT, 512 */
++};
++/* The host side's MAC (ECM iMACAddress); the phone's own is ..:02 */
++static const char *const ud_strings[] = {
++	NULL, "ios-metroid", "Metroid iOS (USB Ethernet)", "0001", "02005E77EE01",
++};
++static const uint8_t ud_phone_mac[ETHER_ADDR_LEN] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x02 };
++
++static uint32_t
++ud_string(unsigned idx, uint8_t *out)
++{
++	if (idx == 0) {
++		out[0] = 4; out[1] = 3; out[2] = 0x09; out[3] = 0x04;   /* en-US */
++		return 4;
++	}
++	if (idx >= sizeof(ud_strings) / sizeof(ud_strings[0])) {
++		return 0;
++	}
++	const char *str = ud_strings[idx];
++	uint32_t n = 2;
++	for (; *str && n < 126; str++) {
++		out[n++] = (uint8_t)*str;
++		out[n++] = 0;
++	}
++	out[0] = (uint8_t)n;
++	out[1] = 3;
++	return n;
++}
++
++static void ud_rx_arm(void);
++static void ud_tx_kick_locked(void);
++static void ud_link_event(bool up);
++
++/* NETWORK_CONNECTION notification: the host brings its link up on it. */
++static void
++ud_notify_connected(void)
++{
++	uint8_t *n = (uint8_t *)(ud.dma + UD_NOTIFY);
++	n[0] = 0xa1; n[1] = 0x00;       /* NETWORK_CONNECTION */
++	n[2] = 1; n[3] = 0;             /* connected */
++	n[4] = 0; n[5] = 0;             /* interface 0 */
++	n[6] = 0; n[7] = 0;
++	ud_start_trb(EP_INT, UD_TRB_INT, UD_NOTIFY, 8, TRBCTL_NORMAL);
++}
++
++/* SET_CONFIGURATION(1): bulk IN/OUT and the interrupt endpoint. */
++static void
++ud_configure(void)
++{
++	if (ud.configured) {
++		return;
++	}
++	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG | (2u << 16), 0, 0, 0) ||
++	    ud_epcmd(EP_RX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3), (1u << 8) | ((uint32_t)EP_RX << 25), 0) ||
++	    ud_epcmd(EP_RX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
++	    ud_epcmd(EP_TX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3) | (1u << 17), (1u << 8) | ((uint32_t)EP_TX << 25), 0) ||
++	    ud_epcmd(EP_TX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
++	    ud_epcmd(EP_INT, DEPCMD_SETEPCONFIG, (3u << 1) | (16u << 3) | (2u << 17),
++	    (1u << 8) | (8u << 16) | ((uint32_t)EP_INT << 25), 0) ||
++	    ud_epcmd(EP_INT, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
++		printf("METROID USB: data endpoints setup failed\n");
++		return;
++	}
++	dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT));
++	ud.configured = true;
++	ud_rx_arm();
++	printf("METROID USB: ECM endpoints configured\n");
++}
++
++static void
++ud_setup(void)
++{
++	const uint8_t *st = (const uint8_t *)(ud.dma + UD_SETUP);
++	uint8_t *data = (uint8_t *)(ud.dma + UD_DATA);
++	uint8_t type = st[0], req = st[1];
++	uint16_t value = (uint16_t)(st[2] | st[3] << 8);
++	uint16_t index = (uint16_t)(st[4] | st[5] << 8);
++	uint16_t length = (uint16_t)(st[6] | st[7] << 8);
++	uint32_t n = 0;
++	bool ok = true;
++	if (!mu_setup_supported(st)) { ud_stall(); return; }
++
++	printf("METROID USB: setup %02x %02x %04x %04x len %u\n", type, req, value, index, length);
++	ud.data_in = (type & 0x80) != 0;
++	if ((type & 0x60) == 0x20) {    /* class request (e.g. SET_ETHERNET_PACKET_FILTER) */
++		ok = (length == 0);
++	} else if ((type & 0x60) != 0) {
++		ok = false;
++	} else if (req == 6) {          /* GET_DESCRIPTOR */
++		switch (value >> 8) {
++		case 1: memcpy(data, ud_dev_desc, sizeof(ud_dev_desc)); n = sizeof(ud_dev_desc); break;
++		case 2: memcpy(data, ud_cfg_desc, sizeof(ud_cfg_desc)); n = sizeof(ud_cfg_desc); break;
++		case 3: n = ud_string(value & 0xff, data); ok = n != 0; break;
++		default: ok = false; break;
++		}
++	} else if (req == 5) {          /* SET_ADDRESS: takes effect now (DWC3 handles the timing) */
++		uint32_t dcfg = dwc_rd(DCFG) & ~(0x7fu << 3);
++		dwc_wr(DCFG, dcfg | ((uint32_t)(value & 0x7f) << 3));
++		printf("METROID USB: address %u\n", value & 0x7f);
++	} else if (req == 9) {          /* SET_CONFIGURATION */
++		if (!value && ud.configured) { ud.dead = true; return; }
++		if (value == 1) {
++			ud_configure();
++		}
++		printf("METROID USB: configured (%u)\n", value);
++	} else if (req == 8) {          /* GET_CONFIGURATION */
++		data[0] = ud.configured ? 1 : 0; n = 1;
++	} else if (req == 0) {          /* GET_STATUS */
++		data[0] = 0; data[1] = 0; n = 2;
++	} else if (req == 11) {         /* SET_INTERFACE */
++		if (index == 1) {
++			ud.data_alt = (uint8_t)value;
++			if (value == 1 && ud.configured && ud.data_alt == 1 && !ud.dead) {
++				ud_notify_connected();
++				ud_link_event(true);
++			} else { ud_link_event(false); }
++		}
++	} else if (req == 10) {         /* GET_INTERFACE */
++		data[0] = index == 1 ? ud.data_alt : 0; n = 1;
++	} else if (req == 1 || req == 3) { /* CLEAR/SET_FEATURE (halt, remote wakeup) */
++	} else {
++		ok = false;
++	}
++	if (!ok) {
++		ud_stall();
++		return;
++	}
++	if (length == 0) {
++		ud.state = EP0_WAIT_STATUS2;    /* status stage on XferNotReady */
++		return;
++	}
++	ud.state = EP0_DATA;
++	if (ud.data_in) {
++		if (n > length) {
++			n = length;
++		}
++		ud_start(1, UD_DATA, n, TRBCTL_DATA);
++	} else {
++		ud_start(0, UD_DATA, 64, TRBCTL_DATA);  /* OUT data is not used here */
++	}
++}
++
++/* ---- network interface (ue0) ---- */
++
++static void
++ud_rx_arm(void)
++{
++	ud_start_trb(EP_RX, UD_TRB_RX, UD_RX, UD_FRAME_MAX, TRBCTL_NORMAL);
++}
++
++static void
++ud_rx_done(void)
++{
++	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
++	ud_sync(UD_TRB_RX, 16);
++	uint32_t len;
++	if (!mu_rx_length(t[2], t[3], UD_FRAME_MAX, &len)) { ud.dead = true; return; }
++	ud_sync(UD_RX, UD_FRAME_MAX);
++	if (ud.ifp != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
++		/*
++		 * One mbuf with a 2 KiB cluster holds any frame. (mbuf_allocpacket
++		 * may return a first mbuf of length 0: stripping the header from
++		 * it panicked "Failed mbuf validity check: len -14".)
++		 */
++		mbuf_t m = NULL;
++		if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
++		    mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
++		    (mbuf_flags(m) & MBUF_EXT) && mbuf_maxlen(m) >= len) {
++			struct ifnet_stat_increment_param stats = {};
++			memcpy(mbuf_data(m), (const void *)(ud.dma + UD_RX), len);
++			mbuf_setlen(m, len);
++			mbuf_pkthdr_setlen(m, len);
++			void *frame_header = mbuf_data(m);
++			mbuf_pkthdr_setrcvif(m, ud.ifp);
++			mbuf_pkthdr_setheader(m, frame_header);
++			mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
++			(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
++			stats.packets_in = 1;
++			stats.bytes_in = len;
++			ud.rx_frames++;
++			ifnet_input(ud.ifp, m, &stats);
++		} else if (m != NULL) {
++			mbuf_freem(m);
++		}
++	}
++	ud_rx_arm();
++}
++
++/* Start the next queued frame if the IN endpoint is idle. ud.lock held. */
++static void
++ud_tx_kick_locked(void)
++{
++	while (!ud.tx_busy && ud.txq_count > 0 && ud.configured && ud.data_alt == 1 && !ud.dead) {
++		mbuf_t m = ud.txq[ud.txq_head];
++		ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
++		ud.txq_count--;
++		size_t len = mbuf_pkthdr_len(m);
++		if (len > ETHER_MAX_LEN - ETHER_CRC_LEN) {
++			mbuf_freem(m);
++			continue;
++		}
++		mbuf_copydata(m, 0, len, (void *)(ud.dma + UD_TX));
++		mbuf_freem(m);
++		/* A frame of a multiple of 512 bytes would need a zero-length
++		 * packet to end it; one pad byte does the same (IP ignores it). */
++		if ((len % 512) == 0) {
++			((uint8_t *)(ud.dma + UD_TX))[len++] = 0;
++		}
++		ud.tx_busy = true;
++		ud.tx_frames++;
++		ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, (uint32_t)len, TRBCTL_NORMAL);
++	}
++}
++
++static errno_t
++ud_if_output(ifnet_t ifp, mbuf_t m)
++{
++	lck_mtx_lock(ud.lock);
++	size_t length = mbuf_pkthdr_len(m);
++	if (length < ETHER_HDR_LEN || length > ETHER_MAX_LEN - ETHER_CRC_LEN ||
++	    ud.dead || ud.txq_count == UD_TXQ || !ud.configured || ud.data_alt != 1) {
++		lck_mtx_unlock(ud.lock);
++		mbuf_freem(m);
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++		return 0;
++	}
++	ifnet_stat_increment_out(ifp, 1, (uint32_t)length, 0);
++	ud.txq[(ud.txq_head + ud.txq_count) % UD_TXQ] = m;
++	ud.txq_count++;
++	ud_tx_kick_locked();
++	lck_mtx_unlock(ud.lock);
++	return 0;
++}
++
++/*
++ * Link state for configd (KernelEventMonitor reads SIOCGIFMEDIA and the
++ * KEV_DL_LINK_ON/OFF events; IPMonitor does not route through a service
++ * whose interface has no active link).
++ */
++static void
++ud_link_event(bool up)
++{
++	if (ud.ifp != NULL) {
++		ifnet_set_flags(ud.ifp, up ? IFF_RUNNING : 0, IFF_RUNNING);
++		metroid_usb_iokit_link(up);
++		dlil_post_msg(ud.ifp, KEV_DL_SUBCLASS, up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF, NULL, 0, FALSE);
++	}
++}
++
++static errno_t
++ud_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
++{
++	switch (cmd) {
++	case SIOCGIFDEVMTU: {
++		struct ifreq *ifr = (struct ifreq *)data;
++		ifr->ifr_devmtu.ifdm_current = (int)ifnet_mtu(ifp);
++		ifr->ifr_devmtu.ifdm_min = 68;
++		ifr->ifr_devmtu.ifdm_max = ETHERMTU;
++		return 0;
++	}
++	case SIOCSIFMTU: {
++		int mtu = ((struct ifreq *)data)->ifr_mtu;
++		if (mtu < 68 || mtu > ETHERMTU) return EINVAL;
++		return ifnet_set_mtu(ifp, (uint32_t)mtu);
++	}
++	case SIOCGIFMEDIA32:
++	case SIOCGIFMEDIA64: {
++		struct ifmediareq *ifmr = (struct ifmediareq *)data;
++		user_addr_t list = (cmd == SIOCGIFMEDIA64) ?
++		    ((struct ifmediareq64 *)ifmr)->ifmu_ulist :
++		    CAST_USER_ADDR_T(((struct ifmediareq32 *)ifmr)->ifmu_ulist);
++		int media = IFM_ETHER | IFM_AUTO;
++		ifmr->ifm_current = media;
++		ifmr->ifm_active = (ud.configured && ud.data_alt == 1 && !ud.dead) ? (IFM_ETHER | IFM_100_TX | IFM_FDX) : media;
++		ifmr->ifm_mask = 0;
++		ifmr->ifm_status = IFM_AVALID | ((ud.configured && ud.data_alt == 1 && !ud.dead) ? IFM_ACTIVE : 0);
++		if (list != USER_ADDR_NULL && ifmr->ifm_count > 0) {
++			ifmr->ifm_count = 1;
++			return copyout(&media, list, sizeof(media));
++		}
++		ifmr->ifm_count = 1;
++		return 0;
++	}
++	case SIOCSIFADDR:
++	case SIOCAIFADDR:
++		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
++		return 0;
++	case SIOCSIFFLAGS:
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		return 0;
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static void
++ud_if_detach(ifnet_t ifp __unused)
++{
++}
++
++/* ue0, 192.168.7.2/24 (the host side is 192.168.7.1). */
++static void
++ud_if_create(void)
++{
++	struct ifnet_init_eparams init;
++	static lck_grp_t *grp;
++
++	grp = lck_grp_alloc_init("metroid_usb", LCK_GRP_ATTR_NULL);
++	if (!grp) return;
++	ud.lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
++	if (!ud.lock) return;
++
++	bzero(&init, sizeof(init));
++	init.ver = IFNET_INIT_CURRENT_VERSION;
++	init.len = sizeof(init);
++	init.flags = IFNET_INIT_LEGACY;
++	init.uniqueid = "metroid-usb-ecm";
++	init.uniqueid_len = sizeof("metroid-usb-ecm") - 1;
++	init.name = "en";
++	init.unit = 0;
++	init.family = IFNET_FAMILY_ETHERNET;
++	init.type = IFT_ETHER;
++	init.output = ud_if_output;
++	init.demux = ether_demux;
++	init.add_proto = ether_add_proto;
++	init.del_proto = ether_del_proto;
++	init.check_multi = ether_check_multi;
++	init.framer_extended = ether_frameout_extended;
++	init.ioctl = ud_if_ioctl;
++	init.detach = ud_if_detach;
++	init.broadcast_addr = etherbroadcastaddr;
++	init.broadcast_len = ETHER_ADDR_LEN;
++	if (ifnet_allocate_extended(&init, &ud.ifp) != 0) {
++		printf("METROID USB: ifnet_allocate failed\n");
++		ud.ifp = NULL;
++		return;
++	}
++	ifnet_set_addrlen(ud.ifp, ETHER_ADDR_LEN);
++	ifnet_set_hdrlen(ud.ifp, sizeof(struct ether_header));
++	ifnet_set_mtu(ud.ifp, ETHERMTU);
++	ifnet_set_baudrate(ud.ifp, 480000000);
++	ifnet_set_flags(ud.ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
++	if (ifnet_attach(ud.ifp, NULL) != 0) {
++		printf("METROID USB: ifnet_attach failed\n");
++		ud.ifp = NULL;
++		return;
++	}
++	ifnet_set_lladdr(ud.ifp, ud_phone_mac, ETHER_ADDR_LEN);
++
++	errno_t err = proto_plumb(PF_INET, ud.ifp);
++	socket_t so = NULL;
++	if (err == 0) {
++		err = sock_socket(PF_INET, SOCK_DGRAM, 0, NULL, NULL, &so);
++	}
++	if (err == 0) {
++		struct ifaliasreq ifra;
++		bzero(&ifra, sizeof(ifra));
++		snprintf(ifra.ifra_name, sizeof(ifra.ifra_name), "en0");
++		struct sockaddr_in *a = (struct sockaddr_in *)&ifra.ifra_addr;
++		a->sin_len = sizeof(*a);
++		a->sin_family = AF_INET;
++		a->sin_addr.s_addr = htonl(0xc0a80702);         /* 192.168.7.2 */
++		a = (struct sockaddr_in *)&ifra.ifra_mask;
++		a->sin_len = sizeof(*a);
++		a->sin_family = AF_INET;
++		a->sin_addr.s_addr = htonl(0xffffff00);
++		a = (struct sockaddr_in *)&ifra.ifra_broadaddr;
++		a->sin_len = sizeof(*a);
++		a->sin_family = AF_INET;
++		a->sin_addr.s_addr = htonl(0xc0a807ff);
++		err = sock_ioctl(so, SIOCAIFADDR, &ifra);
++		sock_close(so);
++	}
++	ifnet_set_flags(ud.ifp, IFF_UP, IFF_UP | IFF_RUNNING);
++	printf("METROID USB: en0 192.168.7.2/24 %s (err %d)\n", err ? "NOT configured" : "up", err);
++	if (err) ud.dead = true;
++	else metroid_usb_iokit_publish(ud_phone_mac);
++}
++
++static void
++ud_event(uint32_t ev)
++{
++	if (ev & 1) {                   /* device event */
++		uint32_t type = (ev >> 8) & 0xf;
++		if (type == 1) {        /* USB reset */
++			if (ud.configured) { ud.dead = true; return; }
++			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
++			printf("METROID USB: bus reset\n");
++		} else if (type == 2) { /* connect done */
++			uint32_t speed = dwc_rd(DSTS) & 7;
++			/* ep0 max packet: 64 at high/full speed (modify action) */
++			ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3) | (2u << 30),
++			    (1u << 8) | (1u << 10) | (0u << 25), 0);
++			ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3) | (2u << 30),
++			    (1u << 8) | (1u << 10) | (1u << 25), 0);
++			printf("METROID USB: connected, speed %u\n", speed);
++		} else if (type == 0) {
++			printf("METROID USB: disconnect\n");
++			if (ud.configured) ud.dead = true;
++		}
++		return;
++	}
++	unsigned ep = (ev >> 1) & 0x1f;
++	unsigned type = (ev >> 6) & 0xf;
++	unsigned status = (ev >> 12) & 0xf;
++
++	if (ep == EP_RX && type == 1) {
++		ud_rx_done();
++		return;
++	}
++	if (ep == EP_TX && type == 1) {
++		lck_mtx_lock(ud.lock);
++		ud_sync(UD_TRB_TX, 16);
++		volatile uint32_t *trb = (volatile uint32_t *)(ud.dma + UD_TRB_TX);
++		if (!ud.tx_busy || (trb[3] & TRB_HWO) || trb[2]) ud.dead = true;
++		ud.tx_busy = false;
++		ud_tx_kick_locked();
++		lck_mtx_unlock(ud.lock);
++		return;
++	}
++	if (ep > 1) {
++		return;
++	}
++	/*
++	 * Control transfer state machine (Linux dwc3 ep0.c): SETUP completes ->
++	 * request handled; the data stage (if any) is started right away; the
++	 * status stage is started when the controller reports XferNotReady
++	 * with status "control status"; its completion re-arms SETUP.
++	 */
++	if (type == 1) {                /* XferComplete */
++		switch (ud.state) {
++		case EP0_SETUP:
++			ud_sync(UD_SETUP, 8);
++			ud_setup();
++			break;
++		case EP0_DATA:
++			ud.state = EP0_WAIT_STATUS3;
++			break;
++		case EP0_STATUS:
++			ud_start_setup();
++			break;
++		default:
++			break;
++		}
++		return;
++	}
++	if (type == 3 && status == 2) { /* XferNotReady, control status phase */
++		if (ud.state == EP0_WAIT_STATUS2 || ud.state == EP0_WAIT_STATUS3) {
++			uint32_t ctl = ud.state == EP0_WAIT_STATUS3 ? TRBCTL_STATUS3 : TRBCTL_STATUS2;
++			ud.state = EP0_STATUS;
++			ud_start(ep, UD_DATA, 0, ctl);
++		}
++	}
++}
++
++static void
++ud_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	uint32_t ticks = 0;
++	for (;;) {
++  if (ud.dead || usb_dma_fault()) {
++   ud.dead = true; dwc_wr(DEVTEN, 0); dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
++   ud_link_event(false); printf("METROID USB: quarantined; DMA memory pinned until reboot\n");
++   (void)thread_terminate(current_thread()); return;
++  }
++  uint32_t count = dwc_rd(GEVNTCOUNT) & 0xffff;
++  if (!mu_event_count(count, UD_EVT_SIZE)) { ud.dead = true; continue; }
++		if (count) {
++			ud_sync(UD_EVT, UD_EVT_SIZE);
++			for (uint32_t done = 0; done < count; done += 4) {
++				uint32_t ev = *(volatile uint32_t *)(ud.dma + UD_EVT + ud.evt_pos);
++				ud.evt_pos = (ud.evt_pos + 4) % UD_EVT_SIZE;
++				if (ud.events++ < 200) {
++					printf("METROID USB: event 0x%08x\n", ev);
++				}
++				ud_event(ev);
++				if (ud.dead) break;
++			}
++			dwc_wr(GEVNTCOUNT, count);
++		}
++		if ((++ticks % 30000) == 0) {
++			printf("METROID USB: en0 rx %llu tx %llu frames\n", ud.rx_frames, ud.tx_frames);
++		}
++		ud_sleep_ms(1);
++	}
++}
++
++static void
++metroid_usb_gadget_start(vm_offset_t dwc)
++{
++	thread_t thread;
++
++	ud.dwc = dwc;
++	/* Require the bootloader's gadget fully halted before touching DMA routes. */
++ if (!(dwc_rd(DSTS) & DSTS_DEVCTRLHLT) || (dwc_rd(DCTL) & DCTL_RUN_STOP) ||
++     ((dwc_rd(GCTL) >> 12) & 3) != 2) {
++  printf("METROID USB: need halted inherited device mode; preserving controller\n"); return;
++ }
++
++	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
++	dwc_wr(DCTL, DCTL_CSFTRST);
++	int i;
++	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
++		delay(1000);
++	}
++	printf("METROID USB: soft reset %s after %d ms, GCTL 0x%08x DCFG 0x%08x\n",
++	    (dwc_rd(DCTL) & DCTL_CSFTRST) ? "STUCK" : "done", i, dwc_rd(GCTL), dwc_rd(DCFG));
++	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
++		return;
++	}
++
++ if (!usb_dma_init()) return;
++ ud_if_create();
++ if (!ud.ifp || !ud.lock || ud.dead) return;
++	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_bus + UD_EVT));
++	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_bus + UD_EVT) >> 32));
++	dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);     /* interrupt masked: polled */
++	dwc_wr(GEVNTCOUNT, dwc_rd(GEVNTCOUNT) & 0xffff);
++	ud.evt_pos = 0;
++
++	/* High speed, address 0 */
++	uint32_t dcfg = dwc_rd(DCFG) & ~(7u | (0x7fu << 3));
++	dwc_wr(DCFG, dcfg | 0);
++	/* Events: disconnect, USB reset, connect done */
++	dwc_wr(DEVTEN, 0x7);
++
++	/* Endpoint 0 OUT/IN: start config, control type, max packet 512 until connect done. */
++	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0) ||
++	    ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (0u << 25), 0) ||
++	    ud_epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
++	    ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (1u << 25), 0) ||
++	    ud_epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
++		printf("METROID USB: endpoint 0 setup failed\n");
++		return;
++	}
++	dwc_wr(DALEPENA, 0x3);
++	ud_start_setup();
++	if (ud.dead) return;
++
++	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
++	if (qs != 0) {
++		uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL);
++  /* Vendor dwc3-msm-core.c: UTMI VBUS valid; inherit mux selection.
++   * This USB2-only port does not assert SuperSpeed lane power. */
++  usb_wr(qs, QSCRATCH_HS_PHY_CTRL, hs | UTMI_OTG_VBUS_VALID);
++
++	}
++
++	if (ud.dead || usb_dma_fault()) return;
++	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
++	for (i = 0; i < 500 && (dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
++		delay(1000);
++	}
++	if (dwc_rd(DSTS) & DSTS_DEVCTRLHLT) {
++		ud.dead = true;
++		dwc_wr(DEVTEN, 0);
++		dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
++		printf("METROID USB: RUN_STOP failed; controller halted\n");
++		return;
++	}
++	printf("METROID USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n", dwc_rd(DSTS), i, ud.dma_bus);
++	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		ud.dead = true;
++		dwc_wr(DEVTEN, 0);
++		dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
++	}
++
++}
++
++static bool
++usb_dma_init(void)
++{
++	if (!(dwc_rd(DSTS) & DSTS_DEVCTRLHLT) || (dwc_rd(DCTL) & (DCTL_RUN_STOP | DCTL_CSFTRST))) return false;
++	vm_offset_t memory = 0;
++	if (kmem_alloc_contig(kernel_map, &memory, 0x8000, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) return false;
++	ppnum_t first = pmap_find_phys(kernel_pmap, memory);
++	ppnum_t last = pmap_find_phys(kernel_pmap, memory + 0x4000);
++	if (!first || ptoa_64(last) != ptoa_64(first) + 0x4000) return false;
++	ud.dma = memory;
++	usb_domain.pool = (uint8_t *)memory;
++	usb_domain.pool_pa = ptoa_64(first);
++	usb_domain.tables = (uint64_t *)(memory + 0x4000);
++	usb_domain.tables_pa = ptoa_64(first) + 0x4000;
++	usb_domain.sid = 0x40;
++	usb_domain.smmu = ml_io_map(0x15000000, 0x100000);
++	usb_domain.controller_halted = true;
++	if (!usb_domain.smmu) return false;
++	metroid_smmu_lock();
++	int error = mu_map_dma(&usb_domain);
++	metroid_smmu_unlock();
++	if (error) { printf("METROID USB: isolated DMA setup failed %d; stopped\n", error); return false; }
++	ud.dma_bus = MU_IOVA;
++	CleanPoC_DcacheRegion_Force(memory, UD_SIZE);
++	return true;
++}
++
++static bool
++usb_dma_fault(void)
++{
++	struct mu_domain *h = &usb_domain;
++	if (!h->mapped || h->failed) return true;
++	uint32_t fsr = mu_sr(h, mu_cb(h, h->cb) + 0x58);
++	if ((fsr & MU_SMMU_FSR_FAULT) ||
++	    mu_sr(h, 0x800 + 4 * h->smr) != (0x80000000u | h->sid) ||
++	    (mu_sr(h, 0xc00 + 4 * h->smr) & 0x300ffu) != h->cb) {
++		printf("METROID USB: DMA route/fault FSR=%#x; quarantined\n", fsr);
++		h->failed = true; return true;
++	}
++	return false;
++}
++
++/* Clock offsets from pinned gcc-tuna.c, domain from captured tuna-gdsc DT.
++ * Reuse ABL's initialized PHY/repeater; never read a gated controller/PHY.
++ */
++static void
++usb_probe(unsigned mode)
++{
++	static const uint32_t clocks[] = {0x39018, 0x39090, 0x39094, 0x3902c, 0x39028};
++	vm_offset_t gcc = ml_io_map(0x100000, 0xa0000);
++	if (!gcc) return;
++	uint32_t power = usb_rd(gcc, 0x39004);
++	bool running = power != UINT32_MAX && (power & (1u << 31));
++	printf("METROID USB: GDSC=%#x\n", power);
++	for (unsigned i = 0; i < sizeof(clocks)/sizeof(clocks[0]); i++) {
++		uint32_t value = usb_rd(gcc, clocks[i]);
++		printf("METROID USB: CBCR[%#x]=%#x\n", clocks[i], value);
++		if (value == UINT32_MAX || (value & (1u << 31))) running = false;
++	}
++	if (!running) { printf("METROID USB: need inherited USB power/clocks; no controller access\n"); return; }
++	vm_offset_t core = ml_io_map(0xa600000, 0x10000);
++	if (!core) return;
++	uint32_t id = usb_rd(core, 0xc120);
++	printf("METROID USB: ID=%#x GCTL=%#x DCTL=%#x DSTS=%#x\n", id,
++	    usb_rd(core, GCTL), usb_rd(core, DCTL), usb_rd(core, DSTS));
++	if ((id >> 16) != 0x5533 && (id >> 16) != 0x3331 && (id >> 16) != 0x3332) return;
++	if (mode == 2) metroid_usb_gadget_start(core);
++}
++
++static void
++usb_start_thread(void *arg, wait_result_t result __unused)
++{
++	usb_probe((unsigned)(uintptr_t)arg);
++	(void)thread_terminate(current_thread());
++}
++void
++metroid_usb_init(void)
++{
++	static unsigned started;
++	unsigned mode = 0;
++	thread_t thread;
++	(void)PE_parse_boot_argn("metroidusb", &mode, sizeof(mode));
++	if ((mode != 1 && mode != 2) || __atomic_exchange_n(&started, 1, __ATOMIC_ACQUIRE)) return;
++	if (kernel_thread_start(usb_start_thread, (void *)(uintptr_t)mode, &thread) == KERN_SUCCESS)
++		thread_deallocate(thread);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- /dev/null
++++ b/bsd/dev/metroid_usb_dma.h
+@@ -0,0 +1,247 @@
++/* USB-only private SMMUv2 domain, derived from metroid_touch_dma.h.
++ * This caller owns a halted/reset DWC3 controller and exact unmasked SID0x40.
++ * A fresh bank is mandatory; no inherited table or context is rewritten.
++ */
++#define MU_POOL_SIZE UD_SIZE
++#define MU_TABLE_SIZE 0x3000u
++#define MU_IOVA 0x400000u
++#define MU_ADDR_MASK 0x0000fffffffff000ull
++#define MU_SMMU_FSR_FAULT 0xc00001feu
++#define MU_CLEAN(va,n) CleanPoC_DcacheRegion_Force((vm_offset_t)(va),(n))
++#define MU_BARRIER() __builtin_arm_dsb(0xf)
++#define MU_LOG(...) printf(__VA_ARGS__)
++struct mu_domain {
++    vm_offset_t smmu;
++    uint8_t *pool;
++    uint64_t *tables;
++    uint64_t pool_pa, tables_pa;
++    uint32_t sid, pgshift, gr1, cb_base, ncb, ns2cb, nsmr, ips;
++    uint32_t smr, cb, asid, old_smr, old_s2cr;
++    bool configured, mapped, failed, controller_halted;
++};
++static uint32_t mu_sr(struct mu_domain *h, uint32_t off) { return usb_rd(h->smmu,off); }
++static void mu_sw(struct mu_domain *h, uint32_t off,uint32_t v) { usb_wr(h->smmu,off,v); }
++static uint32_t mu_cb(struct mu_domain *h,uint32_t cb) { return h->cb_base+(cb<<h->pgshift); }
++static uint64_t mu_sr64(struct mu_domain *h,uint32_t off) { return (uint64_t)mu_sr(h,off)|((uint64_t)mu_sr(h,off+4)<<32); }
++static void mu_sw64(struct mu_domain *h,uint32_t off,uint64_t v) {
++    *(volatile uint64_t *)(h->smmu+off)=v; MU_BARRIER();
++}
++static int mu_poll(struct mu_domain *h,bool unused,uint32_t off,uint32_t mask,uint32_t want,unsigned us) {
++    (void)unused; uint64_t start=usb_now_us();
++    do { if ((mu_sr(h,off)&mask)==want) return 0; delay(5); } while(usb_now_us()-start<us);
++    return ETIMEDOUT;
++}
++/* Per-USB SMMUv2 stage1 domain; preserve all other firmware streams.
++ * arm-smmu/qsmmuv500 and fastmap reference: Nothing031e8669. */
++static bool
++mu_smr_matches(struct mu_domain *h, uint32_t smr)
++{
++	uint32_t mask = (smr >> 16) & 0x7fff;
++	return (smr & (1u << 31)) && !(((smr & 0xffff) ^ h->sid) & ~mask);
++}
++
++/* Find a faulting/unmatched-fault stream, then allocate a fresh context bank.
++ * Every context referenced by firmware, including touch/UFS, remains reserved.
++ * No global reset, CLIENTPD change or unrelated-stream TLB invalidation. */
++static int
++mu_choose_context(struct mu_domain *h)
++{
++	uint32_t id0 = mu_sr(h, 0x20), id1 = mu_sr(h, 0x24), id2 = mu_sr(h, 0x28);
++	uint32_t scr0 = mu_sr(h, 0);
++	MU_LOG("METROID USB SMMU: ID0=%08x ID1=%08x ID2=%08x CR0=%08x\n", id0, id1, id2, scr0);
++	if (!id0 || id0 == UINT32_MAX || !id1 || id1 == UINT32_MAX || id2 == UINT32_MAX ||
++	    !(id0 & (1u << 30)) || !(id0 & (1u << 27)) || !(id2 & (1u << 12)) ||
++	    (scr0 & ((1u << 0) | (1u << 3)))) {
++		MU_LOG("METROID USB SMMU: need active SMMUv2 stage-1/4K/SMR, no extended IDs; ID=%08x/%08x/%08x CR0=%08x\n", id0, id1, id2, scr0);
++		return ENOTSUP;
++	}
++	h->pgshift = (id1 & (1u << 31)) ? 16 : 12;
++	h->gr1 = 1u << h->pgshift;
++	h->cb_base = (1u << (((id1 >> 28) & 7) + 1)) << h->pgshift;
++	h->ncb = id1 & 0xff;
++	h->ns2cb = (id1 >> 16) & 0xff;
++	h->nsmr = id0 & 0xff;
++	/* Stage-1 output width is ID2.IAS (IPA width), not ID2.OAS. */
++	h->ips = id2 & 0xf;
++	/* QSMMUv500 exposes more than 128 SMR/S2CR groups (138 on Metroid).
++	 * Nothing's qsmmuv500_impl retains ID0.NUMSMRG; the generic Qualcomm
++	 * implementation's 128-group workaround is not installed for this IP.
++	 * The 8-bit count bounds both arrays of registers inside GR0: up to
++	 * SMR[254] at 0xbf8 and S2CR[254] at 0xff8. Context-bank bookkeeping
++	 * below is indexed by CBNDX, not by the number of streams.
++	 */
++	if (!h->ncb || h->ncb > 128 || !h->nsmr ||
++	    h->ns2cb >= h->ncb || h->ips > 5 ||
++	    (uint64_t)h->cb_base + ((uint64_t)h->ncb << h->pgshift) > 0x100000) {
++		MU_LOG("METROID USB SMMU: unsupported geometry: page_shift=%u CB_base=%x contexts=%u stage2_only=%u SMRs=%u IPS=%u aperture=100000\n",
++		    h->pgshift, h->cb_base, h->ncb, h->ns2cb, h->nsmr, h->ips);
++		return ENOTSUP;
++	}
++	bool referenced[128] = { false }, used_asid[256] = { false };
++	uint32_t matches = 0, free_smr = UINT32_MAX;
++	h->smr = UINT32_MAX;
++	for (uint32_t i = 0; i < h->nsmr; i++) {
++		uint32_t s = mu_sr(h, 0x800 + 4 * i), c = mu_sr(h, 0xc00 + 4 * i);
++		if (!(s & (1u << 31))) { if (free_smr == UINT32_MAX) { free_smr = i; } continue; }
++		if (mu_smr_matches(h, s)) { h->smr = i; matches++; }
++		if (((c >> 16) & 3) == 0 && (c & 0xff) < h->ncb) { referenced[c & 0xff] = true; }
++	}
++	if (matches > 1) { return EBUSY; }
++	h->cb = UINT32_MAX;
++	if (matches == 1) {
++		h->old_smr = mu_sr(h, 0x800 + 4 * h->smr);
++		h->old_s2cr = mu_sr(h, 0xc00 + 4 * h->smr);
++		if (h->old_smr != ((1u << 31) | h->sid)) { return EBUSY; }
++  /* Dedicated USB SID, after confirmed controller halt/reset. A fresh
++   * bank preserves the inherited bank and every other firmware stream.
++   * Never take over a masked/shared SID match or a running controller. */
++  if (!h->controller_halted || h->sid != 0x40 ||
++      ((h->old_s2cr >> 16) & 3) == 3) return EBUSY;
++
++	} else {
++		/* sCR0.USFCFG=1 faults unmatched streams; otherwise they bypass.
++		 * Do not change the behavior of an inherited bypass stream. */
++		if (!(scr0 & (1u << 10)) && !h->controller_halted) { return EBUSY; }
++		if (free_smr == UINT32_MAX) { return ENOSPC; }
++		h->smr = free_smr;
++		h->old_smr = mu_sr(h, 0x800 + 4 * h->smr);
++		h->old_s2cr = mu_sr(h, 0xc00 + 4 * h->smr);
++	}
++	for (uint32_t i = h->ns2cb; i < h->ncb; i++) {
++		uint32_t b = mu_cb(h, i);
++		uint64_t ttbr = mu_sr64(h, b + 0x20), ttbr1 = mu_sr64(h, b + 0x28);
++		used_asid[(ttbr >> 48) & 0xff] = true;
++		used_asid[(ttbr1 >> 48) & 0xff] = true;
++		if (h->cb == UINT32_MAX && !referenced[i] && !(mu_sr(h, b) & 1)) { h->cb = i; }
++	}
++	if (h->cb == UINT32_MAX) {
++		MU_LOG("METROID USB SMMU: no unused disabled stage-1 context; firmware contexts preserved\n");
++		return ENOSPC;
++	}
++	MU_LOG("METROID USB SMMU: allocate fresh CB=%u; inherited USB S2CR=%08x is preserved until attach\n",
++	    h->cb, h->old_s2cr);
++	h->asid = 0;
++	for (uint32_t i = 1; i < 256; i++) { if (!used_asid[i]) { h->asid = i; break; } }
++	return h->asid ? 0 : ENOSPC;
++}
++
++/* Three 4K tables: 32-bit IOVA -> L1 (four entries) -> L2 -> L3.
++ * Only the DMA pool is mapped; neighbouring pages and all other IOVAs fault.
++ * SMMU's 4K granule is independent of the CPU's 16K XNU page size. */
++static int
++mu_build_tables(struct mu_domain *h)
++{
++	static const uint8_t pa_bits[] = { 32, 36, 40, 42, 44, 48 };
++	if (!h->tables || !h->pool || h->ips > 5 || (h->pool_pa & 4095) ||
++	    (h->tables_pa & 4095) || h->pool_pa > (1ull << pa_bits[h->ips]) - MU_POOL_SIZE ||
++	    h->tables_pa > (1ull << pa_bits[h->ips]) - MU_TABLE_SIZE) { return EINVAL; }
++	memset(h->tables, 0, MU_TABLE_SIZE);
++	uint64_t *l1 = h->tables, *l2 = l1 + 512, *l3 = l2 + 512;
++	l1[(MU_IOVA >> 30) & 3] = (h->tables_pa + 0x1000) | 3;
++	l2[(MU_IOVA >> 21) & 511] = (h->tables_pa + 0x2000) | 3;
++	for (uint32_t i = 0; i < MU_POOL_SIZE / 4096; i++) {
++		/* AF, inner-shareable, unprivileged R/W, AttrIdx0 WB, nG, XN. */
++		l3[i] = (h->pool_pa + (uint64_t)i * 4096) | 3 | (1u << 6) |
++		    (3u << 8) | (1u << 10) | (1u << 11) | (3ull << 53);
++	}
++	MU_CLEAN((uintptr_t)h->tables, MU_TABLE_SIZE);
++	MU_BARRIER();
++	return 0;
++}
++
++static int
++mu_tlb_sync(struct mu_domain *h, uint32_t asid)
++{
++	uint32_t b = mu_cb(h, h->cb);
++	mu_sw(h, b + 0x610, asid);
++	mu_sw(h, b + 0x7f0, 0);
++	return mu_poll(h, true, b + 0x7f4, 1, 0, 100000);
++}
++
++/* Linux writes configuration without whole-register equality checks.
++ * Report normalization, but only reject differences that would change the
++ * translation format, page-table address, or USB stream destination. */
++static int
++mu_check32(struct mu_domain *h, uint32_t off, uint32_t want, uint32_t mask, const char *name)
++{
++	uint32_t got = mu_sr(h, off);
++	if (got != want) {
++		MU_LOG("METROID USB SMMU: %s readback want=%08x got=%08x required=%08x %s\n",
++		    name, want, got, mask, ((got ^ want) & mask) ? "blocked/incompatible" : "continuing");
++	}
++	return ((got ^ want) & mask) ? EPERM : 0;
++}
++
++static int
++mu_check_ttbr(struct mu_domain *h, uint32_t off, uint64_t want)
++{
++	uint64_t got = mu_sr64(h, off);
++	const uint64_t mask = MU_ADDR_MASK | (0xffffull << 48);
++	if (got != want) {
++		MU_LOG("METROID USB SMMU: TTBR0 readback want=%llx got=%llx %s\n",
++		    (unsigned long long)want, (unsigned long long)got,
++		    ((got ^ want) & mask) ? "blocked/incompatible" : "continuing");
++	}
++	return ((got ^ want) & mask) ? EPERM : 0;
++}
++
++static int
++mu_map_dma(struct mu_domain *h)
++{
++	if (!h->controller_halted || h->sid != 0x40) return EBUSY;
++	int error = mu_choose_context(h);
++	if (error) { return error; }
++	error = mu_build_tables(h);
++	if (error) { return error; }
++	uint32_t b = mu_cb(h, h->cb);
++	/* The USB controller is halted/reset. Keep this context disabled on failure;
++	 * the permanent pool/tables remain pinned for any late device accesses. */
++	h->configured = true;
++	uint32_t old_asid = (uint32_t)(mu_sr64(h, b + 0x20) >> 48);
++	mu_sw(h, b, 0);
++	if ((error = mu_check32(h, b, 0, 1, "SCTLR disable"))) { goto fail; }
++	if (mu_tlb_sync(h, old_asid)) { error = ETIMEDOUT; goto fail; }
++	uint32_t cbar = (1u << 16) | (0xfu << 12) | (3u << 8);
++	/* Linux io-pgtable's noncoherent-walk case: outer-shareable, inner
++	 * and outer noncacheable table reads. Tables are explicitly cleaned
++	 * above and immutable while attached; firmware coherency is not assumed.
++	 * Endpoint PTEs remain Normal WB and use explicit cache ownership below. */
++	uint32_t tcr = (1u << 23) | (2u << 12) | 32;
++	uint32_t tcr2 = (7u << 15) | h->ips; /* 8-bit ASID; TCR2.AS stays zero */
++	uint64_t ttbr = h->tables_pa | ((uint64_t)h->asid << 48);
++	mu_sw(h, h->gr1 + 0x800 + 4 * h->cb, 1); /* AArch64 */
++	mu_sw(h, h->gr1 + 4 * h->cb, cbar);
++	mu_sw(h, b + 0x10, tcr2);
++	mu_sw(h, b + 0x30, tcr);
++	mu_sw64(h, b + 0x20, ttbr);
++	mu_sw64(h, b + 0x28, 0);
++	mu_sw(h, b + 0x38, 0xff); /* MAIR0 Attr0: Normal WB */
++	mu_sw(h, b + 0x3c, 0);
++	mu_sw(h, b + 0x58, mu_sr(h, b + 0x58) & MU_SMMU_FSR_FAULT);
++	if ((error = mu_check32(h, h->gr1 + 0x800 + 4 * h->cb, 1, 1, "CBA2R VA64")) ||
++	    (error = mu_check32(h, h->gr1 + 4 * h->cb, cbar, 3u << 16, "CBAR stage")) ||
++	    (error = mu_check32(h, b + 0x10, tcr2, 0xf, "TCR2 PA size")) ||
++	    (error = mu_check32(h, b + 0x30, tcr, (1u << 23) | (1u << 22) | (3u << 14) | (1u << 7) | 0x3f, "TCR format")) ||
++	    (error = mu_check_ttbr(h, b + 0x20, ttbr)) ||
++	    (error = mu_check32(h, b + 0x38, 0xff, 0xff, "MAIR Attr0"))) { goto fail; }
++	if (mu_tlb_sync(h, h->asid)) { error = ETIMEDOUT; goto fail; }
++	/* Abort on faults rather than stall forever; poll FSR instead of using IRQ. */
++	uint32_t sctlr = (1u << 12) | (1u << 5) | (1u << 2) | (1u << 1) | 1;
++	mu_sw(h, b, sctlr);
++	if ((error = mu_check32(h, b, sctlr, 1, "SCTLR enable"))) { goto fail; }
++	/* Linux uses TRANS + PRIVCFG_DEFAULT when attaching a DMA domain. */
++	uint32_t s2cr = h->cb;
++	mu_sw(h, 0xc00 + 4 * h->smr, s2cr);
++	if ((error = mu_check32(h, 0xc00 + 4 * h->smr, s2cr, (3u << 16) | 0xff, "S2CR route"))) { goto fail; }
++	mu_sw(h, 0x800 + 4 * h->smr, (1u << 31) | h->sid);
++	if ((error = mu_check32(h, 0x800 + 4 * h->smr, (1u << 31) | h->sid, UINT32_MAX, "SMR match"))) { goto fail; }
++	h->mapped = true;
++	MU_LOG("METROID USB DMA: stream SMR=%u CB=%u ASID=%u IOVA=%llx PA=%llx bytes=%x TTBR=%llx (NC table walks, explicit cache sync)\n",
++	    h->smr, h->cb, h->asid, (unsigned long long)MU_IOVA,
++	    (unsigned long long)h->pool_pa, MU_POOL_SIZE, (unsigned long long)h->tables_pa);
++	return 0;
++fail:
++	mu_sw(h, b, 0);
++	h->failed = true;
++	return error;
++}
+--- /dev/null
++++ b/bsd/dev/metroid_usb_protocol.h
+@@ -0,0 +1,29 @@
++/* USB2 CDC-ECM control and DMA completion bounds; no hardware accesses. */
++#ifndef METROID_USB_PROTOCOL_H
++#define METROID_USB_PROTOCOL_H
++static inline bool mu_setup_supported(const uint8_t *p)
++{
++ unsigned type=p[0], request=p[1], value=p[2]|((unsigned)p[3]<<8);
++ unsigned index=p[4]|((unsigned)p[5]<<8), length=p[6]|((unsigned)p[7]<<8);
++ if ((type&0x60)==0x20)
++  return type==0x21 && request==0x43 && !index && !length && value<=0x1f;
++ if (type&0x60) return false;
++ switch (request) {
++ case 6: return type==0x80 && (value>>8)>=1 && (value>>8)<=3;
++ case 5: return !type && value<128 && !index && !length;
++ case 9: return !type && value<=1 && !index && !length;
++ case 8: return type==0x80 && !value && !index && length==1;
++ case 0: return (type==0x80 || type==0x81 || type==0x82) && !value && length==2;
++ case 11: return type==1 && index<=1 && value<=(index?1u:0u) && !length;
++ case 10: return type==0x81 && !value && index<=1 && length==1;
++ default: return false;
++ }
++}
++static inline bool mu_rx_length(uint32_t size, uint32_t control, uint32_t capacity, uint32_t *length)
++{
++ if (!length || (control&1) || (size>>28) || (size&0xffffff)>capacity) return false;
++ *length=capacity-(size&0xffffff); return true;
++}
++static inline bool mu_event_count(uint32_t count, uint32_t capacity)
++{ return !(count&3) && count<=capacity; }
++#endif
+--- /dev/null
++++ b/iokit/Kernel/arm/MetroidUSBEthernet.cpp
+@@ -0,0 +1,193 @@
++/*
++ * IOKit discovery bridge for the already-attached Metroid BSD Ethernet ifnet.
++ * This is NOT Apple's IONetworkingFamily ABI or a second packet driver.
++ * These minimal class names implement the discovery contract consumed by
++ * configd-1241.140.6 SCNetworkInterface.c and Plugins/InterfaceNamer/ifnamer.c.
++ * Do not load IONetworkingFamily alongside this built-in implementation.
++ *
++ * InterfaceNamer requires an openable IONetworkStack even for SelfNamed
++ * interfaces. Its naming commands are never needed for our fixed en0; all
++ * user-client methods/property writes are explicitly unsupported. Packet I/O,
++ * addressing, flags, multicast and media continue through the real BSD ifnet.
++ */
++#include <pexpert/arm64/board_config.h>
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSBoolean.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSString.h>
++#include <libkern/c++/OSUnserialize.h>
++#include <pexpert/pexpert.h>
++
++class IONetworkInterface : public IOService {
++    OSDeclareDefaultStructors(IONetworkInterface);
++public:
++    IOReturn setProperties(OSObject *) APPLE_KEXT_OVERRIDE { return kIOReturnUnsupported; }
++};
++OSDefineMetaClassAndStructors(IONetworkInterface, IOService);
++
++class IOEthernetInterface : public IONetworkInterface {
++    OSDeclareDefaultStructors(IOEthernetInterface);
++};
++OSDefineMetaClassAndStructors(IOEthernetInterface, IONetworkInterface);
++
++class IONetworkStackUserClient : public IOUserClient {
++    OSDeclareDefaultStructors(IONetworkStackUserClient);
++public:
++    IOReturn clientClose(void) APPLE_KEXT_OVERRIDE {
++        terminate();
++        return kIOReturnSuccess;
++    }
++    IOReturn setProperties(OSObject *) APPLE_KEXT_OVERRIDE { return kIOReturnUnsupported; }
++    IOReturn externalMethod(uint32_t, IOExternalMethodArguments *,
++        IOExternalMethodDispatch *, OSObject *, void *) APPLE_KEXT_OVERRIDE {
++        return kIOReturnUnsupported;
++    }
++};
++OSDefineMetaClassAndStructors(IONetworkStackUserClient, IOUserClient);
++
++class IONetworkStack : public IOService {
++    OSDeclareDefaultStructors(IONetworkStack);
++public:
++    IOReturn setProperties(OSObject *) APPLE_KEXT_OVERRIDE { return kIOReturnUnsupported; }
++    IOReturn newUserClient(task_t task, void *security, UInt32 type,
++        OSDictionary *properties, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(IONetworkStack, IOService);
++
++IOReturn IONetworkStack::newUserClient(task_t task, void *security, UInt32 type,
++    OSDictionary *properties, IOUserClient **handler)
++{
++    if (!handler) return kIOReturnBadArgument;
++    *handler = nullptr;
++    if (type != 0) return kIOReturnUnsupported;
++    if (IOUserClient::clientHasPrivilege(task, kIOClientPrivilegeAdministrator)
++        != kIOReturnSuccess) return kIOReturnNotPrivileged;
++    auto client = new IONetworkStackUserClient;
++    if (!client) return kIOReturnNoMemory;
++    if (!client->initWithTask(task, security, type, properties)) {
++        client->release();
++        return kIOReturnNoMemory;
++    }
++    if (!client->attach(this)) {
++        client->release();
++        return kIOReturnError;
++    }
++    if (!client->start(this)) {
++        client->detach(this);
++        client->release();
++        return kIOReturnError;
++    }
++    *handler = client;
++    IOLog("METROID USB IOKIT: IONetworkStack connection opened\n");
++    return kIOReturnSuccess;
++}
++
++/* Retained for the boot lifetime, like the underlying non-detachable ifnet.
++ * The driver's one USB polling thread is the only writer after publication. */
++static IOService *usb_controller;
++static IOEthernetInterface *usb_interface;
++static IONetworkStack *network_stack;
++
++/* Defaults for native SCNetworkService creation; Settings can override them.
++ * Unlike the old helper this never writes configd's dynamic store. */
++static OSDictionary *network_defaults(void)
++{
++    static const char xml[] =
++        "<dict><key>IPv4</key><dict>"
++        "<key>ConfigMethod</key><string>Manual</string>"
++        "<key>Addresses</key><array><string>192.168.7.2</string></array>"
++        "<key>SubnetMasks</key><array><string>255.255.255.0</string></array>"
++        "<key>Router</key><string>192.168.7.1</string>"
++        "</dict><key>DNS</key><dict>"
++        "<key>ServerAddresses</key><array><string>1.1.1.1</string><string>8.8.8.8</string></array>"
++        "</dict></dict>";
++    OSObject *object = OSUnserializeXML(xml);
++    auto result = OSDynamicCast(OSDictionary, object);
++    if (!result && object) object->release();
++    return result;
++}
++
++extern "C" void metroid_usb_iokit_publish(const uint8_t *mac)
++{
++    int enabled = 1;
++    (void)PE_parse_boot_argn("metroidusb_iokit", &enabled, sizeof(enabled));
++    if (!enabled || usb_interface || !mac) return;
++
++    /* IOResources supplies a real IOService-plane ancestor for discovery. */
++    IOService *resources = IOService::getResourceService();
++    if (!resources) {
++        IOLog("METROID USB IOKIT: IOResources unavailable\n");
++        return;
++    }
++    auto controller = new IOService;
++    auto interface = new IOEthernetInterface;
++    auto stack = new IONetworkStack;
++    auto defaults = network_defaults();
++    auto address = OSData::withBytes(mac, 6);
++    bool controller_attached = false, interface_attached = false, stack_attached = false;
++    bool controller_started = false, interface_started = false, stack_started = false;
++    if (!controller || !interface || !stack || !defaults || !address) goto fail;
++    if (!controller->init() || !interface->init() || !stack->init()) goto fail;
++    controller->setName("MetroidUSBEthernetController");
++    interface->setName("en0");
++    stack->setName("IONetworkStack");
++    if (!controller->setProperty("SelfNamed", kOSBooleanTrue) ||
++        !controller->setProperty("IOMACAddress", address) ||
++        !controller->setProperty("IOFeatures", 0ULL, 32) ||
++        !controller->setProperty("IOLinkStatus", 1ULL, 32) ||
++        !controller->setProperty("IOLinkSpeed", 0ULL, 64) ||
++        !controller->setProperty("MetroidDiscoveryBridge", kOSBooleanTrue) ||
++        !interface->setProperty("IOBSDName", "en0") ||
++        !interface->setProperty("IOInterfaceNamePrefix", "en") ||
++        !interface->setProperty("IOInterfaceUnit", 0ULL, 32) ||
++        !interface->setProperty("IOInterfaceType", 6ULL, 32) || /* IFT_ETHER */
++        !interface->setProperty("IOInterfaceState", 1ULL, 32) || /* registered */
++        !interface->setProperty("IOBuiltin", kOSBooleanFalse) ||
++        !interface->setProperty("IOPrimaryInterface", kOSBooleanFalse) ||
++        !interface->setProperty("NetworkConfigurationOverrides", defaults)) goto fail;
++    if (!(controller_attached = controller->attach(resources))) goto fail;
++    if (!(controller_started = controller->start(resources))) goto fail;
++    if (!(interface_attached = interface->attach(controller))) goto fail;
++    if (!(interface_started = interface->start(controller))) goto fail;
++    if (!(stack_attached = stack->attach(resources))) goto fail;
++    if (!(stack_started = stack->start(resources))) goto fail;
++    usb_controller = controller;
++    usb_interface = interface;
++    network_stack = stack;
++    defaults->release();
++    address->release();
++    /* Publish only once the complete hierarchy/properties are available. */
++    controller->registerService();
++    interface->registerService();
++    stack->registerService();
++    IOLog("METROID USB IOKIT: en0 IOEthernetInterface + IONetworkStack published; native configd adoption unverified\n");
++    return;
++fail:
++    if (stack_started) stack->stop(resources);
++    if (stack_attached) stack->detach(resources);
++    if (interface_started) interface->stop(controller);
++    if (interface_attached) interface->detach(controller);
++    if (controller_started) controller->stop(resources);
++    if (controller_attached) controller->detach(resources);
++    if (stack) stack->release();
++    if (interface) interface->release();
++    if (controller) controller->release();
++    if (defaults) defaults->release();
++    if (address) address->release();
++    IOLog("METROID USB IOKIT: publication failed; BSD Ethernet remains available\n");
++}
++
++extern "C" void metroid_usb_iokit_link(bool up)
++{
++    if (!usb_controller) return;
++    usb_controller->setProperty("IOLinkStatus", up ? 3ULL : 1ULL, 32);
++    usb_controller->setProperty("IOLinkSpeed", up ? 480000000ULL : 0ULL, 64);
++    /* configd receives the real KEV_DL_LINK_ON/OFF posted by the BSD driver. */
++}
++#endif

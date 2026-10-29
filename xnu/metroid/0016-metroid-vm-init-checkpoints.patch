@@ -1,0 +1,80 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1883,6 +1883,7 @@
+ 	/*
+ 	 * Get the virtual and physical kernel-managed memory base from boot_args.
+ 	 */
++	sweet_early_mark(21, "VM entered; reading boot args");
+ 	gVirtBase = args->virtBase;
+ 	gPhysBase = args->physBase;
+ #if KASAN
+@@ -1921,10 +1922,12 @@
+ #endif
+ 
+ 	// Slide the physical aperture to a random page-aligned location within the slide range
++	sweet_early_mark(22, "VM bounds set; getting slide");
+ 	uint64_t physmap_slide = early_random() & ARM64_PHYSMAP_SLIDE_MASK & ~((uint64_t)PAGE_MASK);
+ 	assert(physmap_slide < ARM64_PHYSMAP_SLIDE_RANGE);
+ 
+ 	physmap_base += physmap_slide;
++	sweet_early_mark(23, "VM slide selected");
+ 
+ #if XNU_MONITOR
+ 	physmap_base = ROUND_TWIG(physmap_base);
+@@ -1999,6 +2002,7 @@
+ #endif
+ 
+ 	/* Initialize invalid tte page */
++	sweet_early_mark(24, "VM allocating root tables");
+ 	invalid_tte = (tt_entry_t *)alloc_ptpage(TRUE);
+ 	invalid_ttep = kvtophys((vm_offset_t)invalid_tte);
+ 	bzero(invalid_tte, ARM_PGBYTES);
+@@ -2025,6 +2029,7 @@
+ 	 *
+ 	 *   the so called physical aperture should be statically mapped
+ 	 */
++	sweet_early_mark(25, "VM building kernel tables");
+ 	init_ptpages(cpu_tte, gVirtBase, dynamic_memory_begin, TRUE, ARM_TTE_TABLE_AP(ARM_TTE_TABLE_AP_USER_NA));
+ 
+ #if defined(ARM_LARGE_MEMORY)
+@@ -2045,6 +2050,7 @@
+ 	/*
+ 	 * Now retrieve addresses for various segments from kernel mach-o header
+ 	 */
++	sweet_early_mark(26, "VM tables ready; reading segments");
+ 	segPRELINKTEXTB  = (vm_offset_t) getsegdatafromheader(&_mh_execute_header, "__PRELINK_TEXT", &segSizePRELINKTEXT);
+ 	segPLKDATACONSTB = (vm_offset_t) getsegdatafromheader(&_mh_execute_header, "__PLK_DATA_CONST", &segSizePLKDATACONST);
+ 	segPLKTEXTEXECB  = (vm_offset_t) getsegdatafromheader(&_mh_execute_header, "__PLK_TEXT_EXEC", &segSizePLKTEXTEXEC);
+@@ -2149,7 +2155,9 @@
+ 	vm_prelink_sdata = segPRELINKDATAB;
+ 	vm_prelink_edata = segPRELINKDATAB + segSizePRELINKDATA;
+ 
++	sweet_early_mark(27, "VM applying segment protections");
+ 	arm_vm_prot_init(args);
++	sweet_early_mark(28, "VM protections done; low globals");
+ 
+ 	/*
+ 	 * Initialize the page tables for the low globals:
+@@ -2193,14 +2201,20 @@
+ 	mt_early_init();
+ #endif /* MONOTONIC */
+ 
++	sweet_early_mark(29, "VM mappings ready; user TBI");
+ 	arm_set_user_tbi();
+ 
+ #if defined(SWEET)
+ 	/* phystokv() must still refer to the bootstrap aperture here. */
++	sweet_early_mark(30, "VM installing console tables");
+ 	sweet_early_map_final();
+-#endif
++	sweet_early_mark(31, "VM console tables installed");
++#endif
++	sweet_early_mark(32, "VM constructing physmap");
+ 	arm_vm_physmap_init(args);
++	sweet_early_mark(33, "VM physmap ready; switch TTBR1");
+ 	set_mmu_ttb_alternate(cpu_ttep & TTBR_BADDR_MASK);
++	sweet_early_mark(34, "VM TTBR1 switched");
+ 
+ 	ml_enable_monitor();
+ 

@@ -1,0 +1,877 @@
+--- a/bsd/dev/metroid_touch.c
++++ b/bsd/dev/metroid_touch.c
+@@ -1,23 +1,28 @@
+ /* Nothing Phone (3): QUP1 SE4 SPI / FocalTech FT3683G touchscreen.
+  * Board facts from the captured Metroid live DT, protocol/register definitions
+- * checked against NothingOSS SM8735 031e8669. No firmware flashing or DMA.
++ * checked against NothingOSS SM8735 031e8669. No firmware flashing; FIFO or GPI DMA transport.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/errno.h>
+ #include <kern/clock.h>
++#include <kern/locks.h>
++#include <vm/vm_kern.h>
++#include <vm/pmap.h>
++#include <arm/caches_internal.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+ extern void sweet_hid_touch_frame(unsigned, const int *, const int *);
+ void metroid_touch_init(void);
+ 
+ #include "metroid_touch_protocol.h"
+-static vm_offset_t mt_se, mt_gcc, mt_gpio;
++static vm_offset_t mt_se, mt_gcc, mt_gpio, mt_gpi;
+ static unsigned mt_started;
+ static uint32_t
+ mt_read(vm_offset_t base, unsigned off)
+@@ -36,6 +41,87 @@
+ #define MT_RD(off) mt_read(mt_se, (off))
+ #define MT_WR(off, value) mt_write(mt_se, (off), (value))
+ #define MT_DELAY(us) delay(us)
++/* Serialize domain reservation/attachment against UFS initialization. */
++static LCK_GRP_DECLARE(mt_dma_group, "metroid-smmu");
++static LCK_MTX_DECLARE(mt_dma_mutex, &mt_dma_group);
++void metroid_smmu_lock(void);
++void metroid_smmu_unlock(void);
++void metroid_smmu_lock(void) { lck_mtx_lock(&mt_dma_mutex); }
++void metroid_smmu_unlock(void) { lck_mtx_unlock(&mt_dma_mutex); }
++static uint64_t mt_now_us(void) {
++    uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++    return ns / NSEC_PER_USEC;
++}
++static bool mt_dma_init(void);
++static bool mt_dma_fault(void);
++#define MG_READ(off) mt_read(mt_gpi, (off))
++#define MG_WRITE(off,v) mt_write(mt_gpi, (off), (v))
++#define MG_CLEAN(p,n) CleanPoC_DcacheRegion_Force((vm_offset_t)(p),(n))
++#define MG_FLUSH(p,n) FlushPoC_DcacheRegion((vm_offset_t)(p),(n))
++#define MG_NOW() mt_now_us()
++#define MG_DELAY(us) delay(us)
++#define MG_LOG(...) printf(__VA_ARGS__)
++#define MG_DMA_INIT() mt_dma_init()
++#define MG_DMA_FAULT() mt_dma_fault()
++#include "metroid_touch_gpi.h"
++#include "metroid_touch_dma.h"
++static struct md_domain mt_domains[2];
++static bool mt_dma_fault(void) {
++    for (unsigned i=0;i<2;i++) {
++        struct md_domain *h=&mt_domains[i];
++        if (h->mapped && (md_sr(h,md_cb(h,h->cb)+0x58)&MD_SMMU_FSR_FAULT)) {
++            printf("METROID TOUCH DMA: SID=%#x CB=%u FSR=%#x FAR=%llx\n",h->sid,h->cb,
++                md_sr(h,md_cb(h,h->cb)+0x58),(unsigned long long)md_sr64(h,md_cb(h,h->cb)+0x60));
++            return true;
++        }
++    }
++    return false;
++}
++static bool mt_dma_init(void) {
++    /* Only SE4 is clocked/owned here. Do not probe unrelated SE banks.
++     * A limited apps-ring audit cannot establish shared-domain ownership:
++     * preflight BOTH SIDs before allowing any SMMU writes. */
++    bool ok=false; metroid_smmu_lock();
++    if (!mg_select() || (MT_RD(0x40)&0x1001)) goto out;
++    printf("METROID TOUCH DMA: preflight shared streams\n");
++    vm_offset_t smmu=ml_io_map(0x15000000,0x100000);
++    if (!smmu) goto out;
++    for (unsigned i=0;i<2;i++) {
++        struct md_domain *h=&mt_domains[i];
++        h->smmu=smmu; h->sid=i?0xa3:0xb6;
++        int err=md_choose_context(h);
++        if (err) {
++            printf("METROID TOUCH DMA: SID=%#x preflight failed errno=%d; shared mappings preserved; stopped\n",h->sid,err);
++            goto out;
++        }
++    }
++    vm_offset_t mem=0;
++    const vm_size_t size=MG_POOL_SIZE+2*0x4000;
++    if (kmem_alloc_contig(kernel_map,&mem,size,PAGE_MASK,0,0,
++        KMA_DATA|KMA_ZERO|KMA_PERMANENT,VM_KERN_MEMORY_IOKIT)!=KERN_SUCCESS) goto out;
++    ppnum_t pn=pmap_find_phys(kernel_pmap,(addr64_t)mem);
++    if (!pn) goto out;
++    uint64_t pa=ptoa_64(pn);
++    for (vm_size_t off=0;off<size;off+=PAGE_SIZE) {
++        ppnum_t p=pmap_find_phys(kernel_pmap,(addr64_t)(mem+off));
++        if (!p || ptoa_64(p)!=pa+off) goto out;
++    }
++    mg.pool=(uint8_t *)mem;
++    MG_CLEAN(mg.pool,MG_POOL_SIZE);
++    for (unsigned i=0;i<2;i++) {
++        struct md_domain *h=&mt_domains[i];
++        h->pool=mg.pool; h->pool_pa=pa;
++        h->tables=(uint64_t *)(mem+MG_POOL_SIZE+i*0x4000);
++        h->tables_pa=pa+MG_POOL_SIZE+i*0x4000;
++        int err=md_map_dma(h);
++        if (err) { printf("METROID TOUCH DMA: SID=%#x mapping failed errno=%d\n",h->sid,err); goto out; }
++        printf("METROID TOUCH DMA: SID=%#x SMR=%u CB=%u ASID=%u mapped\n",h->sid,h->smr,h->cb,h->asid);
++    }
++    ok=true;
++out:
++    metroid_smmu_unlock();
++    return ok;
++}
+ #include "metroid_touch_spi.h"
+ #include "metroid_touch_power.h"
+ 
+@@ -65,7 +151,14 @@
+ 	mt_write(mt_gcc, 0x52008, v | vote);
+ 	if ((mt_read(mt_gcc, 0x52008) & vote) != vote) return false;
+ 	if (!mt_clear(mt_gcc, 0x23000, 1u << 31) ||
+-	    !mt_clear(mt_gcc, 0x23004, 1u << 31) || (MT_RD(0x40) & 0x1001)) return false;
++	    !mt_clear(mt_gcc, 0x23004, 1u << 31) ||
++	    !mt_clear(mt_gcc, 0x183cc, 1u << 31)) {
++		printf("METROID TOUCH: wrapper/SE4 clock halted; stopped\n");
++		return false;
++	}
++	/* Vote readback alone does not mean the SE clock is running. Never
++	 * access SE4 registers before all three branch halt checks complete. */
++	if (MT_RD(0x40) & 0x1001) return false;
+ 
+ 	uint32_t dfs = mt_read(mt_gcc, 0x183f0);
+ 	if (dfs & 1) {
+@@ -95,17 +188,49 @@
+ static bool
+ mt_pin(unsigned pin, unsigned mux, unsigned drive, bool output, bool high)
+ {
+-	/* tuna TLMM GPIO registers start at TLMM+0x100000, not the old Redmi tile. */
++	/* tuna: GPIO_CTL = TLMM + 0x100000 + pin*0x1000. */
+ 	unsigned off = pin * 0x1000;
+-	uint32_t cfg = mt_read(mt_gpio, off);
+-	if (cfg == 0xffffffffu) return false;
+-	/* EGPIO ownership belongs to firmware: don't drive a remotely owned pad. */
+-	if ((cfg & (1u << 11)) && !(cfg & (1u << 12))) return false;
+-	if (output) mt_write(mt_gpio, off + 4,
+-	    (mt_read(mt_gpio, off + 4) & ~2u) | (high ? 2u : 0));
+-	cfg = (cfg & ~0x3ffu) | (mux << 2) | (drive << 6) | (output ? 0x200 : 0);
++	uint32_t before = mt_read(mt_gpio, off);
++	if (before == UINT32_MAX) {
++		printf("METROID TOUCH GPIO: pin%u unreadable CTL=%#x\n", pin, before);
++		return false;
++	}
++	/* Nothing pinctrl-msm.c claims EGPIO-capable pads when selecting a
++	 * local mux. EGPIO_PRESENT is capability, not a prohibition on claim.
++	 * Keep output disabled until local ownership and the latch are verified. */
++	uint32_t cfg = (before & ~0x3ffu) | (mux << 2) | (drive << 6);
++	uint32_t mask = 0x3ffu;
++	if (before & (1u << 11)) { cfg |= 1u << 12; mask |= 1u << 12; }
+ 	mt_write(mt_gpio, off, cfg);
+-	return (mt_read(mt_gpio, off) & 0x3ff) == (cfg & 0x3ff);
++	uint32_t got = mt_read(mt_gpio, off);
++	if (got == UINT32_MAX || ((got ^ cfg) & mask)) {
++		printf("METROID TOUCH GPIO: pin%u mux/ownership failed CTL before=%#x want=%#x got=%#x mask=%#x\n",
++		    pin, before, cfg, got, mask);
++		return false;
++	}
++	if (output) {
++		uint32_t io = mt_read(mt_gpio, off + 4);
++		if (io == UINT32_MAX) {
++			printf("METROID TOUCH GPIO: pin%u unreadable IN_OUT=%#x\n", pin, io);
++			return false;
++		}
++		uint32_t latch = (io & ~2u) | (high ? 2u : 0);
++		mt_write(mt_gpio, off + 4, latch);
++		io = mt_read(mt_gpio, off + 4);
++		if (io == UINT32_MAX || ((io ^ latch) & 2)) {
++			printf("METROID TOUCH GPIO: pin%u output latch failed want=%#x got=%#x\n", pin, latch, io);
++			return false;
++		}
++		cfg |= 1u << 9;
++		mt_write(mt_gpio, off, cfg);
++		got = mt_read(mt_gpio, off);
++		if (got == UINT32_MAX || ((got ^ cfg) & mask)) {
++			printf("METROID TOUCH GPIO: pin%u output enable failed want=%#x got=%#x mask=%#x\n",
++			    pin, cfg, got, mask);
++			return false;
++		}
++	}
++	return true;
+ }
+ static bool
+ mt_read_register(uint8_t reg, uint8_t *data, unsigned n)
+@@ -159,14 +284,18 @@
+ 	mt_sleep(delay_s * 1000);
+ 	mt_gcc = ml_io_map(0x100000, 0x60000);
+ 	mt_se = ml_io_map(0xa90000, 0x4000);
++	/* Map exactly the DT resource; register macros use its EE-adjusted base. */
++	mt_gpi = ml_io_map(0xa00000, 0x60000);
++	if (mt_gpi) mt_gpi -= 0x10000;
+ 	mt_gpio = ml_io_map(0xf100000, 0xc0000);
+-	if (!mt_gcc || !mt_se || !mt_gpio) {
++	if (!mt_gcc || !mt_se || !mt_gpio || !mt_gpi) {
+ 		printf("METROID TOUCH: MMIO mapping failed\n"); goto out;
+ 	}
+ 	if (!mt_clocks()) { printf("METROID TOUCH: clock setup failed\n"); goto out; }
++	printf("METROID TOUCH: wrapper/SE4 clocks ready; GENI probe\n");
+ 	printf("METROID TOUCH: GENI fw=%#x interface=%#x status=%#x\n", MT_RD(0x68), MT_RD(0x64), MT_RD(0x40));
+ 	if (!mt_spi_init()) {
+-		printf("METROID TOUCH: need idle GENI SPI firmware and FIFO access; stopped\n"); goto out;
++		printf("METROID TOUCH: SPI transport initialization failed; see GENI/GPI/DMA diagnostics; stopped\n"); goto out;
+ 	}
+ 	/* Rails first; reset pulse only after both acknowledged power votes. */
+ 	if (metroid_touch_power_enable("ldob22", 3200) ||
+@@ -188,13 +317,13 @@
+ 	if (!mt_write_register(0xa5, 0) || !mt_write_register(0xd0, 0)) {
+ 		printf("METROID TOUCH: normal scan setup failed\n"); goto out;
+ 	}
+-	printf("METROID TOUCH: ready 1260x2800, 10 fingers, SPI 9.6MHz, poll 8ms\n");
++	printf("METROID TOUCH: ready 1260x2800, 10 fingers, SPI 9.6MHz, %s, poll 8ms\n", mt_use_gpi ? "GPI DMA" : "FIFO");
+ 	for (;;) {
+ 		mt_sleep(8);
+ 		/* Poll while touching. Idle IRQ is a hint; 104ms watchdog catches lost edges. */
+ 		if (!frame.mask && (mt_read(mt_gpio, 176 * 0x1000 + 4) & 1) && ++idle_ticks < 13) continue;
+ 		idle_ticks = 0;
+-		struct mt_frame next;
++		struct mt_frame next = {0};
+ 		int decoded = mt_read_register(1, report, sizeof(report)) ? mt_decode(report, sizeof(report), &next) : -1;
+ 		if (decoded <= 0) {
+ 			if (++errors == 1) printf("METROID TOUCH: report rejected kind=%d dead=%d\n", decoded, mt_dead);
+--- a/bsd/dev/metroid_touch_spi.h
++++ b/bsd/dev/metroid_touch_spi.h
+@@ -7,24 +7,28 @@
+ static unsigned mt_fifo_depth;
+ static unsigned mt_clock_sel;
+ static bool mt_dead;
++static bool mt_use_gpi;
+ static bool
+ mt_spi_init(void)
+ {
+ 	uint32_t fw = MT_RD(0x68), tx = MT_RD(0xe24), rx = MT_RD(0xe28);
+ 	mt_fifo_depth = (tx >> 16) & 0x3f;
+ 	if (fw == 0xffffffffu || ((fw >> 8) & 0xff) != 1 ||
+-	    (MT_RD(0x64) & 1) || MT_RD(0x40) & 0x1001 ||
++	    MT_RD(0x40) & 0x1001) return false;
++	mt_use_gpi = (MT_RD(0x64) & 1) != 0;
++	if (!mt_use_gpi && (
+ 	    ((tx >> 24) & 0x3f) != 32 || mt_fifo_depth < 2 ||
+ 	    ((rx >> 16) & 0x3f) < 2 ||
+-	    MT_RD(0x800) || MT_RD(0x804)) return false;
+-	/* Do not route interrupts or DMA to unowned GIC/GPI channels. */
+-	MT_WR(0xe18, 0); MT_WR(0xe1c, 0);
++	    MT_RD(0x800) || MT_RD(0x804))) return false;
++	if (mt_use_gpi && !mg_init()) return false;
++	/* Keep GENI CPU IRQs masked in both modes. */
++	MT_WR(0xe18, mt_use_gpi ? 15 : 0); MT_WR(0xe1c, 0);
+ 	MT_WR(0x614, 0); MT_WR(0x644, 0);
+ 	MT_WR(0x618, 0xffffffffu); MT_WR(0x648, 0xffffffffu);
+ 	MT_WR(0x28, MT_RD(0x28) | 0x7f);
+ 	MT_WR(0xe30, MT_RD(0xe30) | 15);
+ 	MT_WR(0x24, 0x7f); MT_WR(0x20, 1);
+-	MT_WR(0x258, 0); MT_WR(0x7c, mt_clock_sel); MT_WR(0x48, (2u << 4) | 1);
++	MT_WR(0x258, mt_use_gpi ? 1 : 0); MT_WR(0x7c, mt_clock_sel); MT_WR(0x48, (2u << 4) | 1);
+ 	MT_WR(0x224, 0); MT_WR(0x22c, 0); MT_WR(0x230, 0);
+ 	MT_WR(0x24c, 0); MT_WR(0x250, 0); MT_WR(0x25c, 0);
+ 	MT_WR(0x268, 4); /* GENI word length = 8 - 4 */
+@@ -33,14 +37,20 @@
+ 	MT_WR(0x260, 0x7f8fe); MT_WR(0x264, 0xffefe);
+ 	MT_WR(0x284, 0x7f8fe); MT_WR(0x288, 0xffefe);
+ 	MT_WR(0x254, 0); MT_WR(0x80c, 0); MT_WR(0x810, 0);
+-	MT_WR(0x814, ((rx >> 16) & 0x3f) - 1);
+-	return MT_RD(0x258) == 0 && MT_RD(0x268) == 4 &&
++	if (!mt_use_gpi) MT_WR(0x814, ((rx >> 16) & 0x3f) - 1);
++	return MT_RD(0x258) == (mt_use_gpi ? 1u : 0u) && MT_RD(0x268) == 4 &&
+ 	    MT_RD(0x260) == 0x7f8fe && MT_RD(0x264) == 0xffefe;
+ }
+ static bool
+ mt_spi_transfer(const uint8_t *tx, uint8_t *rx, unsigned n)
+ {
+ 	unsigned sent = 0, received = 0;
++	if (mt_use_gpi) {
++		if (mt_dead) return false;
++		bool ok = mg_transfer(tx, rx, n, mt_clock_sel);
++		if (!ok) mt_dead = true;
++		return ok;
++	}
+ 	if (mt_dead || !n || n > MT_WIRE_SIZE || (MT_RD(0x40) & 0x1001) ||
+ 	    MT_RD(0x800) || MT_RD(0x804)) return false;
+ 	MT_WR(0x618, 0xffffffffu);
+--- /dev/null
++++ b/bsd/dev/metroid_touch_gpi.h
+@@ -0,0 +1,304 @@
++/* Polled QUP1 GPI SPI. Register/TRE reference: NothingOSS 031e8669,
++ * msm_gpi{,_mmio.h}, msm_gpi.h, spi-msm-geni.c. No GSI firmware upload.
++ * Only app dynamic GPIIs 1..4; static GPII0 and other EEs are never reset.
++ * MG_{READ,WRITE,CLEAN,FLUSH,NOW,DELAY} and MG_DMA_INIT supplied by caller.
++ */
++#ifndef METROID_TOUCH_GPI_H
++#define METROID_TOUCH_GPI_H
++/* Nothing DT: max-num-gpii=12 is capacity, not an access mask.
++ * Apps dynamic1..4, static0; contexts5..11 are never accessed. */
++#define MG_APP_DYNAMIC_MASK 0x1eu
++#define MG_APP_STATIC_MASK 0x1u
++#define MG_APP_ACCESS_MASK (MG_APP_DYNAMIC_MASK | MG_APP_STATIC_MASK)
++#define MG_RING_SIZE 1024u
++#define MG_EVENT_SIZE 2048u
++#define MG_POOL_SIZE 0x4000u
++#define MG_IOVA 0x200000u
++#define MG_TX 0u
++#define MG_RX 0x400u
++#define MG_EV 0x800u
++#define MG_TX_DATA 0x1000u
++#define MG_RX_DATA 0x1100u
++struct mg_tre { uint32_t d[4]; };
++struct mg_host {
++	uint8_t *pool;
++	uint32_t instance, tx_wp, rx_wp, ev_rp;
++	unsigned notice_logs, status_logs;
++	bool owned, dead, ready;
++};
++static struct mg_host mg;
++static uint32_t mg_off(uint32_t off) { return off + mg.instance * 0x4000; }
++static uint32_t mg_r(uint32_t off) { return MG_READ(mg_off(off)); }
++static void mg_w(uint32_t off, uint32_t val) { MG_WRITE(mg_off(off), val); }
++static uint32_t mg_state(uint32_t off) { return (mg_r(off) >> 20) & 15; }
++static bool
++mg_error(void)
++{
++	return mg_r(0x23100) != 0 || mg_r(0x23118) != 0 || MG_DMA_FAULT();
++}
++static bool
++mg_stop(const char *why)
++{
++	mg.dead = true; mg.ready = false;
++	MG_LOG("METROID TOUCH GPI: %s; quarantined GPII%u ch=%#x/%#x ev=%#x global=%#x general=%#x error=%#x\n",
++	    why, mg.instance, mg_r(0x20000), mg_r(0x20080), mg_r(0x21000),
++	    mg_r(0x23100), mg_r(0x23118), mg_r(0x23200));
++	/* No reset, unmap, free or retry after uncertain DMA. Pinned pages and
++	 * translations remain valid until reboot. Mask only our GPII IRQ output. */
++	if (mg.owned) {
++		mg_w(0x23088, 0);
++
++	}
++	return false;
++}
++static bool
++mg_command(bool event, unsigned ch, unsigned op, unsigned state)
++{
++	uint32_t src = event ? 0x23094 : 0x23090;
++	uint32_t clr = event ? 0x230a4 : 0x230a0;
++	uint32_t bit = 1u << ch, ctx = event ? 0x21000 : 0x20000 + 0x80 * ch;
++	mg_w(clr, bit);
++	if (mg_r(src) & bit) return mg_stop("stale command completion");
++	mg_w(event ? 0x23010 : 0x23008, (op << 24) | ch);
++	uint64_t start = MG_NOW();
++	do {
++		if (mg_error()) return mg_stop("command hardware error");
++		if ((mg_r(src) & bit) && mg_state(ctx) == state) {
++			mg_w(clr, bit);
++			return true;
++		}
++		MG_DELAY(5);
++	} while (MG_NOW() - start < 250000);
++	MG_LOG("METROID TOUCH GPI: command event=%u ch=%u op=%u expected-state=%u\n", event, ch, op, state);
++	return mg_stop("command timeout/state mismatch");
++}
++static bool
++mg_quiesce(void)
++{
++	unsigned inherited = 12;
++	/* Reclaim only an app pair explicitly identifying this touchscreen.
++	 * Audit only DT-authorized apps contexts before changing that pair. */
++	for (unsigned i = 0; i < 12; i++) {
++		if (!(MG_APP_ACCESS_MASK & (1u << i))) continue;
++		mg.instance = i;
++		MG_LOG("METROID TOUCH GPI: inspect GPII%u\n", i);
++		uint32_t a = mg_r(0x20000), b = mg_r(0x20080), e = mg_r(0x21000);
++		if (a == UINT32_MAX || b == UINT32_MAX || e == UINT32_MAX) return false;
++		if (!((a | b | e) & 0xf00000u)) continue;
++		uint32_t sa = mg_r(0x20060), sb = mg_r(0x200e0);
++		if (!(MG_APP_DYNAMIC_MASK & (1u << i)) || inherited != 12 ||
++		    (sa & 0x1f80ff) != 0x10014 || (sb & 0x1f80ff) != 0x14 ||
++		    mg_state(0x20000) > 3 || mg_state(0x20080) > 3 || mg_state(0x21000) != 1) {
++			MG_LOG("METROID TOUCH GPI: inherited GPII%u not an owned SE4 SPI pair; stopped\n", i);
++			return false;
++		}
++		inherited = i;
++	}
++	if (inherited == 12) return true;
++	mg.instance = inherited; mg.owned = true;
++	mg_w(0x23088, 0);
++	mg_w(0x23098, 3); mg_w(0x2309c, 1);
++	/* The old domains remain attached until stop/reset/deallocate completes.
++	 * No other GPII, EE, firmware image or global GSI state is reset. */
++	for (unsigned ch = 0; ch < 2; ch++) {
++		unsigned state = mg_state(0x20000 + 0x80 * ch);
++		if (!state) continue;
++		if (state == 2 && !mg_command(false, ch, 2, 3)) return false;
++		if (!mg_command(false, ch, 9, 1) || !mg_command(false, ch, 10, 0)) return false;
++	}
++	if (!mg_command(true, 0, 10, 0)) return false;
++	MG_LOG("METROID TOUCH GPI: quiesced inherited SE4 SPI GPII%u\n", inherited);
++	mg.owned = false;
++	return true;
++}
++static bool
++mg_select(void)
++{
++	unsigned candidate = 12;
++	/* Only inspect apps-owned rings. This cannot prove wrapper-wide idle;
++	 * DMA setup separately refuses to replace inherited live translations. */
++	for (unsigned i = 0; i < 12; i++) {
++		if (!(MG_APP_ACCESS_MASK & (1u << i))) continue;
++		mg.instance = i;
++		uint32_t a = mg_r(0x20000), b = mg_r(0x20080), e = mg_r(0x21000);
++		if (a == UINT32_MAX || b == UINT32_MAX || e == UINT32_MAX) {
++			MG_LOG("METROID TOUCH GPI: unreadable GPII%u; cannot establish stream ownership\n", i);
++			return false;
++		}
++		if (((a | b | e) & 0xf00000u) != 0) {
++			MG_LOG("METROID TOUCH GPI: inherited GPII%u ch=%#x/%#x ev=%#x; shared DMA stream busy\n", i, a, b, e);
++			return false;
++		}
++		if ((MG_APP_DYNAMIC_MASK & (1u << i)) && candidate == 12) candidate = i;
++	}
++	mg.instance = candidate;
++	return candidate < 12;
++}
++static bool
++mg_config(uint32_t off, uint32_t val, uint32_t mask)
++{
++	mg_w(off, val);
++	uint32_t got = mg_r(off);
++	if (((got ^ val) & mask) == 0) return true;
++	MG_LOG("METROID TOUCH GPI: readback off=%#x want=%#x got=%#x mask=%#x\n", off, val, got, mask);
++	return mg_stop("configuration rejected");
++}
++static bool
++mg_context(bool event, unsigned ch)
++{
++	uint32_t ctx = event ? 0x21000 : 0x20000 + 0x80 * ch;
++	uint32_t off = event ? MG_EV : (ch ? MG_RX : MG_TX);
++	uint32_t size = event ? MG_EVENT_SIZE : MG_RING_SIZE;
++	uint32_t config = (16u << 24) | 2u | (event ? (1u << 16) : (ch ? 0u : 8u));
++	uint32_t db = event ? 0x22100 : 0x22000 + 8 * ch;
++	if (!mg_command(event, ch, 0, 1) ||
++	    !mg_config(ctx, config, event ? 0xff01000fu : 0xff07c00fu) ||
++	    !mg_config(ctx + 4, size, 0xffff) ||
++	    !mg_config(ctx + 8, MG_IOVA + off, UINT32_MAX) ||
++	    !mg_config(ctx + 12, 0, UINT32_MAX)) return false;
++	mg_w(db + 4, 0);
++	if (event) {
++		mg_w(ctx + 0x20, 0); mg_w(ctx + 0x28, 0); mg_w(ctx + 0x2c, 0);
++		mg_w(ctx + 0x30, 0); mg_w(ctx + 0x34, 0);
++		mg_w(db, MG_IOVA + MG_EV + MG_EVENT_SIZE - 16);
++	} else {
++		/* Pair TX0/RX1, protocol SPI=1, serial engine4. */
++		if (!mg_config(ctx + 0x60, ((ch ? 0u : 1u) << 16) | 0x14, 0x1f80ff)) return false;
++		mg_w(ctx + 0x64, 0); mg_w(ctx + 0x68, 0); mg_w(ctx + 0x6c, 0);
++		mg_w(ctx + 0x5c, 1);
++	}
++	return true;
++}
++static bool
++mg_init(void)
++{
++	if (mg.dead || mg.ready) return mg.ready;
++	MG_LOG("METROID TOUCH GPI: inspect apps mask=%#x (dynamic=%#x)\n",
++	    MG_APP_ACCESS_MASK, MG_APP_DYNAMIC_MASK);
++	if (!mg_quiesce() || !mg_select() || !MG_DMA_INIT()) return false;
++	/* DMA setup rechecks apps rings and both shared stream routes. */
++	mg.owned = true;
++	mg_w(0x23088, 0); /* poll raw sources; never enable this GIC interrupt */
++	mg_w(0x23098, 3); mg_w(0x2309c, 1); mg_w(0x230b8, 1);
++	mg_w(0x23108, 1); mg_w(0x23120, 15);
++	mg_w(0x23188, 0); mg_w(0x2318c, 0); mg_w(0x23180, 1);
++	mg_w(0x23400, 0); mg_w(0x23404, 0);
++	if (!mg_context(true, 0) || !mg_context(false, 0) || !mg_context(false, 1) ||
++	    !mg_command(false, 1, 1, 2) || !mg_command(false, 0, 1, 2)) return false;
++	mg.tx_wp = mg.rx_wp = mg.ev_rp = 0;
++	mg.ready = true;
++	MG_LOG("METROID TOUCH GPI: ready GPII%u SE4 TX0/RX1, translated DMA, polled completions\n", mg.instance);
++	return true;
++}
++static void
++mg_tre(uint32_t off, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
++{
++	struct mg_tre *t = (struct mg_tre *)(mg.pool + off);
++	t->d[0] = a; t->d[1] = b; t->d[2] = c; t->d[3] = d;
++}
++static uint32_t mg_next(uint32_t v, uint32_t size) { return (v + 16) & (size - 1); }
++static bool
++mg_pointer(uint32_t p, uint32_t off, uint32_t size)
++{
++	return p >= MG_IOVA + off && p < MG_IOVA + off + size && !(p & 15);
++}
++static bool
++mg_transfer(const uint8_t *tx, uint8_t *rx, unsigned n, unsigned clock_sel)
++{
++	if (!mg.ready || mg.dead || !tx || !rx || !n || n > MT_WIRE_SIZE) return false;
++	if (mg_error() || mg_state(0x20000) != 2 || mg_state(0x20080) != 2)
++		return mg_stop("channel not running");
++	/* One outstanding full-duplex exchange. Never reuse data until both
++	 * matching EOTs and both channel RPs have consumed the queued TREs. */
++	if (mg_r(0x20010) != MG_IOVA + MG_TX + mg.tx_wp || mg_r(0x20014) ||
++	    mg_r(0x20090) != MG_IOVA + MG_RX + mg.rx_wp || mg_r(0x20094) ||
++	    mg_r(0x21010) != MG_IOVA + MG_EV + mg.ev_rp || mg_r(0x21014))
++		return mg_stop("stale ring pointers");
++	memcpy(mg.pool + MG_TX_DATA, tx, n);
++	memset(mg.pool + MG_RX_DATA, 0, 128);
++	uint32_t tw = mg.tx_wp, rw = mg.rx_wp;
++	mg_tre(MG_TX + tw, 0x03000004, 0, (clock_sel << 16) | 2, 0x220001);
++	tw = mg_next(tw, MG_RING_SIZE);
++	mg_tre(MG_TX + tw, 3, 0, n, 0x200801); /* GO duplex, link RX, chain */
++	tw = mg_next(tw, MG_RING_SIZE);
++	uint32_t expected_tx = MG_IOVA + MG_TX + tw, expected_rx = MG_IOVA + MG_RX + rw;
++	mg_tre(MG_TX + tw, MG_IOVA + MG_TX_DATA, 0, n, 0x100200);
++	mg_tre(MG_RX + rw, MG_IOVA + MG_RX_DATA, 0, n, 0x100000);
++	tw = mg_next(tw, MG_RING_SIZE); rw = mg_next(rw, MG_RING_SIZE);
++	MG_CLEAN(mg.pool + MG_TX, MG_RING_SIZE * 2);
++	MG_CLEAN(mg.pool + MG_TX_DATA, 128);
++	MG_FLUSH(mg.pool + MG_RX_DATA, 128);
++	/* Post receive first, so GO never runs without a receive buffer. */
++	mg_w(0x22008, MG_IOVA + MG_RX + rw);
++	mg_w(0x22000, MG_IOVA + MG_TX + tw);
++	unsigned done = 0, events = 0;
++	uint64_t start = MG_NOW();
++	do {
++		if (mg_error()) return mg_stop("DMA hardware fault");
++		uint32_t rp = mg_r(0x21010);
++		if (mg_r(0x21014) || !mg_pointer(rp, MG_EV, MG_EVENT_SIZE))
++			return mg_stop("invalid event producer pointer");
++		while (rp != MG_IOVA + MG_EV + mg.ev_rp) {
++			/* Sideband events do not complete DMA. Bound storms without
++			 * assuming a transfer produces only two event records. */
++			if (++events > 1024 || MG_NOW() - start >= 20000)
++				return mg_stop("event processing limit/deadline");
++			struct mg_tre e;
++			MG_FLUSH(mg.pool + MG_EV + mg.ev_rp, 16);
++			memcpy(&e, mg.pool + MG_EV + mg.ev_rp, sizeof(e));
++			unsigned type = (e.d[3] >> 16) & 255, ch = e.d[3] >> 24;
++			if ((type == 0xff || type == 0x31) && ch < 2) {
++				/* Nothing's SPI callback logs QUP_NOTIFY and continues.
++				 * Its words are status/timestamp/count, not a DMA pointer.
++				 * Stale records are discarded by the GPI core. Neither
++				 * event may set done, copy RX or bypass the deadline. */
++				if (type == 0x31 && mg.notice_logs < 4) {
++					mg.notice_logs++;
++					MG_LOG("METROID TOUCH GPI: notification ch=%u status=%#x time=%#x count=%u\n",
++					    ch, e.d[0], e.d[1], e.d[2] & 0xffffff);
++				}
++				mg.ev_rp = mg_next(mg.ev_rp, MG_EVENT_SIZE);
++				mg_w(0x22100, MG_IOVA + MG_EV + ((mg.ev_rp + MG_EVENT_SIZE - 16) & (MG_EVENT_SIZE - 1)));
++				continue;
++			}
++			unsigned code = e.d[2] >> 24, len = e.d[2] & 0xffffff;
++			unsigned status = e.d[3] & 0xffff;
++			/* Nothing SPI callbacks reject status == UNEXP_ERR (16),
++			 * not every nonzero peripheral status. In particular the
++			 * observed RX EOT has status 3. Status and completion code
++			 * are separate fields; keep the exact EOT/ownership checks. */
++			if (type != 0x22 || ch > 1 || code != 2 || len != n ||
++			    status == 16 || e.d[1] || e.d[0] != (ch ? expected_rx : expected_tx) ||
++			    (done & (1u << ch))) {
++				MG_LOG("METROID TOUCH GPI: rejected event %08x %08x %08x %08x\n", e.d[0], e.d[1], e.d[2], e.d[3]);
++				MG_LOG("METROID TOUCH GPI: type=%#x ch=%u code=%#x len=%u want=%u status=%#x ptr=%#x:%08x expected-TX=%#x RX=%#x done=%#x\n",
++				    type, ch, code, len, n, e.d[3] & 0xffff, e.d[1], e.d[0], expected_tx, expected_rx, done);
++				return mg_stop(type == 0x30 ? "unexpected immediate-data event for buffer DMA" :
++				    ((type == 0x35 || type == 0x36) ? "unexpected Q2SPI event for SPI" : "bad/stale completion"));
++			}
++			if (status && mg.status_logs < 4) {
++				mg.status_logs++;
++				MG_LOG("METROID TOUCH GPI: EOT ch=%u status=%#x len=%u; vendor SPI status policy\n",
++				    ch, status, len);
++			}
++			done |= 1u << ch;
++			mg.ev_rp = mg_next(mg.ev_rp, MG_EVENT_SIZE);
++			mg_w(0x22100, MG_IOVA + MG_EV + ((mg.ev_rp + MG_EVENT_SIZE - 16) & (MG_EVENT_SIZE - 1)));
++		}
++		mg_w(0x230c0, 1);
++		if (done == 3 && mg_r(0x20010) == MG_IOVA + MG_TX + tw &&
++		    mg_r(0x20090) == MG_IOVA + MG_RX + rw && !mg_r(0x20014) && !mg_r(0x20094)) {
++			/* Do not publish RX if a fault arrived with the completions. */
++			if (mg_error() || mg_state(0x20000) != 2 || mg_state(0x20080) != 2)
++				return mg_stop("DMA fault/channel error at completion");
++			mg.tx_wp = tw; mg.rx_wp = rw;
++			MG_FLUSH(mg.pool + MG_RX_DATA, 128);
++			memcpy(rx, mg.pool + MG_RX_DATA, n);
++			MG_DELAY(150); /* FT3683G CS-high spacing */
++			return true;
++		}
++		MG_DELAY(5);
++	} while (MG_NOW() - start < 20000);
++	return mg_stop("transfer timeout");
++}
++#endif
+--- /dev/null
++++ b/bsd/dev/metroid_touch_dma.h
+@@ -0,0 +1,248 @@
++/* Private domains for QUP1 GPI SID b6 and SE SID a3. Based on the
++ * existing Metroid UFS SMMUv2 mapper; caller holds shared attachment lock.
++ * Only our 16KiB permanent DMA pool is mapped. Inherited translating/bypass routes are never replaced.
++ */
++#define MD_POOL_SIZE MG_POOL_SIZE
++#define MD_TABLE_SIZE 0x3000u
++#define MD_IOVA MG_IOVA
++#define MD_ADDR_MASK 0x0000fffffffff000ull
++#define MD_SMMU_FSR_FAULT 0xc00001feu
++#define MD_CLEAN(va,n) MG_CLEAN((void *)(va),(n))
++#define MD_BARRIER() __builtin_arm_dsb(0xf)
++#define MD_LOG(...) printf(__VA_ARGS__)
++struct md_domain {
++    vm_offset_t smmu;
++    uint8_t *pool;
++    uint64_t *tables;
++    uint64_t pool_pa, tables_pa;
++    uint32_t sid, pgshift, gr1, cb_base, ncb, ns2cb, nsmr, ips;
++    uint32_t smr, cb, asid, old_smr, old_s2cr;
++    bool configured, mapped, failed;
++};
++static uint32_t md_sr(struct md_domain *h, uint32_t off) { return mt_read(h->smmu,off); }
++static void md_sw(struct md_domain *h, uint32_t off,uint32_t v) { mt_write(h->smmu,off,v); }
++static uint32_t md_cb(struct md_domain *h,uint32_t cb) { return h->cb_base+(cb<<h->pgshift); }
++static uint64_t md_sr64(struct md_domain *h,uint32_t off) { return (uint64_t)md_sr(h,off)|((uint64_t)md_sr(h,off+4)<<32); }
++static void md_sw64(struct md_domain *h,uint32_t off,uint64_t v) {
++    *(volatile uint64_t *)(h->smmu+off)=v; MD_BARRIER();
++}
++static int md_poll(struct md_domain *h,bool unused,uint32_t off,uint32_t mask,uint32_t want,unsigned us) {
++    (void)unused; uint64_t start=mt_now_us();
++    do { if ((md_sr(h,off)&mask)==want) return 0; delay(5); } while(mt_now_us()-start<us);
++    return ETIMEDOUT;
++}
++/* Per-touch SMMUv2 stage1 domain; preserve all other firmware streams.
++ * arm-smmu/qsmmuv500 and fastmap reference: Nothing031e8669. */
++static bool
++md_smr_matches(struct md_domain *h, uint32_t smr)
++{
++	uint32_t mask = (smr >> 16) & 0x7fff;
++	return (smr & (1u << 31)) && !(((smr & 0xffff) ^ h->sid) & ~mask);
++}
++
++/* Find a faulting/unmatched-fault stream, then allocate a fresh context bank.
++ * Every context referenced by firmware, including touch, remains reserved.
++ * No global reset, CLIENTPD change or unrelated-stream TLB invalidation. */
++static int
++md_choose_context(struct md_domain *h)
++{
++	uint32_t id0 = md_sr(h, 0x20), id1 = md_sr(h, 0x24), id2 = md_sr(h, 0x28);
++	uint32_t scr0 = md_sr(h, 0);
++	MD_LOG("METROID TOUCH SMMU: ID0=%08x ID1=%08x ID2=%08x CR0=%08x\n", id0, id1, id2, scr0);
++	if (!id0 || id0 == UINT32_MAX || !id1 || id1 == UINT32_MAX || id2 == UINT32_MAX ||
++	    !(id0 & (1u << 30)) || !(id0 & (1u << 27)) || !(id2 & (1u << 12)) ||
++	    (scr0 & ((1u << 0) | (1u << 3)))) {
++		MD_LOG("METROID TOUCH SMMU: need active SMMUv2 stage-1/4K/SMR, no extended IDs; ID=%08x/%08x/%08x CR0=%08x\n", id0, id1, id2, scr0);
++		return ENOTSUP;
++	}
++	h->pgshift = (id1 & (1u << 31)) ? 16 : 12;
++	h->gr1 = 1u << h->pgshift;
++	h->cb_base = (1u << (((id1 >> 28) & 7) + 1)) << h->pgshift;
++	h->ncb = id1 & 0xff;
++	h->ns2cb = (id1 >> 16) & 0xff;
++	h->nsmr = id0 & 0xff;
++	/* Stage-1 output width is ID2.IAS (IPA width), not ID2.OAS. */
++	h->ips = id2 & 0xf;
++	/* QSMMUv500 exposes more than 128 SMR/S2CR groups (138 on Metroid).
++	 * Nothing's qsmmuv500_impl retains ID0.NUMSMRG; the generic Qualcomm
++	 * implementation's 128-group workaround is not installed for this IP.
++	 * The 8-bit count bounds both arrays of registers inside GR0: up to
++	 * SMR[254] at 0xbf8 and S2CR[254] at 0xff8. Context-bank bookkeeping
++	 * below is indexed by CBNDX, not by the number of streams.
++	 */
++	if (!h->ncb || h->ncb > 128 || !h->nsmr ||
++	    h->ns2cb >= h->ncb || h->ips > 5 ||
++	    (uint64_t)h->cb_base + ((uint64_t)h->ncb << h->pgshift) > 0x100000) {
++		MD_LOG("METROID TOUCH SMMU: unsupported geometry: page_shift=%u CB_base=%x contexts=%u stage2_only=%u SMRs=%u IPS=%u aperture=100000\n",
++		    h->pgshift, h->cb_base, h->ncb, h->ns2cb, h->nsmr, h->ips);
++		return ENOTSUP;
++	}
++	bool referenced[128] = { false }, used_asid[256] = { false };
++	uint32_t matches = 0, free_smr = UINT32_MAX;
++	h->smr = UINT32_MAX;
++	for (uint32_t i = 0; i < h->nsmr; i++) {
++		uint32_t s = md_sr(h, 0x800 + 4 * i), c = md_sr(h, 0xc00 + 4 * i);
++		if (!(s & (1u << 31))) { if (free_smr == UINT32_MAX) { free_smr = i; } continue; }
++		if (md_smr_matches(h, s)) { h->smr = i; matches++; }
++		if (((c >> 16) & 3) == 0 && (c & 0xff) < h->ncb) { referenced[c & 0xff] = true; }
++	}
++	if (matches > 1) { return EBUSY; }
++	h->cb = UINT32_MAX;
++	if (matches == 1) {
++		h->old_smr = md_sr(h, 0x800 + 4 * h->smr);
++		h->old_s2cr = md_sr(h, 0xc00 + 4 * h->smr);
++		if (h->old_smr != ((1u << 31) | h->sid)) { return EBUSY; }
++		/* TRANS (even a disabled CB) and BYPASS can serve other QUP1
++		 * clients. Apps-only ring checks do not authorize replacing them. */
++		if (((h->old_s2cr >> 16) & 3) != 2) {
++			MD_LOG("METROID TOUCH SMMU: SID=%#x inherited shared S2CR=%08x; need domain reuse, preserving route\n",
++			    h->sid, h->old_s2cr);
++			return EBUSY;
++		}
++
++	} else {
++		/* sCR0.USFCFG=1 faults unmatched streams; otherwise they bypass.
++		 * Do not change the behavior of an inherited bypass stream. */
++		if (!(scr0 & (1u << 10))) { return EBUSY; }
++		if (free_smr == UINT32_MAX) { return ENOSPC; }
++		h->smr = free_smr;
++		h->old_smr = md_sr(h, 0x800 + 4 * h->smr);
++		h->old_s2cr = md_sr(h, 0xc00 + 4 * h->smr);
++	}
++	for (uint32_t i = h->ns2cb; i < h->ncb; i++) {
++		uint32_t b = md_cb(h, i);
++		uint64_t ttbr = md_sr64(h, b + 0x20), ttbr1 = md_sr64(h, b + 0x28);
++		used_asid[(ttbr >> 48) & 0xff] = true;
++		used_asid[(ttbr1 >> 48) & 0xff] = true;
++		if (h->cb == UINT32_MAX && !referenced[i] && !(md_sr(h, b) & 1)) { h->cb = i; }
++	}
++	if (h->cb == UINT32_MAX) {
++		MD_LOG("METROID TOUCH SMMU: no unused disabled stage-1 context; firmware contexts preserved\n");
++		return ENOSPC;
++	}
++	MD_LOG("METROID TOUCH SMMU: allocate fresh CB=%u; firmware touch S2CR=%08x is preserved until attach\n",
++	    h->cb, h->old_s2cr);
++	h->asid = 0;
++	for (uint32_t i = 1; i < 256; i++) { if (!used_asid[i]) { h->asid = i; break; } }
++	return h->asid ? 0 : ENOSPC;
++}
++
++/* Three 4K tables: 32-bit IOVA -> L1 (four entries) -> L2 -> L3.
++ * Only the DMA pool is mapped; neighbouring pages and all other IOVAs fault.
++ * SMMU's 4K granule is independent of the CPU's 16K XNU page size. */
++static int
++md_build_tables(struct md_domain *h)
++{
++	static const uint8_t pa_bits[] = { 32, 36, 40, 42, 44, 48 };
++	if (!h->tables || !h->pool || h->ips > 5 || (h->pool_pa & 4095) ||
++	    (h->tables_pa & 4095) || h->pool_pa > (1ull << pa_bits[h->ips]) - MD_POOL_SIZE ||
++	    h->tables_pa > (1ull << pa_bits[h->ips]) - MD_TABLE_SIZE) { return EINVAL; }
++	memset(h->tables, 0, MD_TABLE_SIZE);
++	uint64_t *l1 = h->tables, *l2 = l1 + 512, *l3 = l2 + 512;
++	l1[(MD_IOVA >> 30) & 3] = (h->tables_pa + 0x1000) | 3;
++	l2[(MD_IOVA >> 21) & 511] = (h->tables_pa + 0x2000) | 3;
++	for (uint32_t i = 0; i < MD_POOL_SIZE / 4096; i++) {
++		/* AF, inner-shareable, unprivileged R/W, AttrIdx0 WB, nG, XN. */
++		l3[i] = (h->pool_pa + (uint64_t)i * 4096) | 3 | (1u << 6) |
++		    (3u << 8) | (1u << 10) | (1u << 11) | (3ull << 53);
++	}
++	MD_CLEAN((uintptr_t)h->tables, MD_TABLE_SIZE);
++	MD_BARRIER();
++	return 0;
++}
++
++static int
++md_tlb_sync(struct md_domain *h, uint32_t asid)
++{
++	uint32_t b = md_cb(h, h->cb);
++	md_sw(h, b + 0x610, asid);
++	md_sw(h, b + 0x7f0, 0);
++	return md_poll(h, true, b + 0x7f4, 1, 0, 100000);
++}
++
++/* Linux writes configuration without whole-register equality checks.
++ * Report normalization, but only reject differences that would change the
++ * translation format, page-table address, or touch stream destination. */
++static int
++md_check32(struct md_domain *h, uint32_t off, uint32_t want, uint32_t mask, const char *name)
++{
++	uint32_t got = md_sr(h, off);
++	if (got != want) {
++		MD_LOG("METROID TOUCH SMMU: %s readback want=%08x got=%08x required=%08x %s\n",
++		    name, want, got, mask, ((got ^ want) & mask) ? "blocked/incompatible" : "continuing");
++	}
++	return ((got ^ want) & mask) ? EPERM : 0;
++}
++
++static int
++md_check_ttbr(struct md_domain *h, uint32_t off, uint64_t want)
++{
++	uint64_t got = md_sr64(h, off);
++	const uint64_t mask = MD_ADDR_MASK | (0xffffull << 48);
++	if (got != want) {
++		MD_LOG("METROID TOUCH SMMU: TTBR0 readback want=%llx got=%llx %s\n",
++		    (unsigned long long)want, (unsigned long long)got,
++		    ((got ^ want) & mask) ? "blocked/incompatible" : "continuing");
++	}
++	return ((got ^ want) & mask) ? EPERM : 0;
++}
++
++static int
++md_map_dma(struct md_domain *h)
++{
++	int error = md_choose_context(h);
++	if (error) { return error; }
++	error = md_build_tables(h);
++	if (error) { return error; }
++	uint32_t b = md_cb(h, h->cb);
++	/* The touch engines are stopped. Keep this context disabled on failure;
++	 * the permanent pool/tables remain pinned for any late device accesses. */
++	h->configured = true;
++	uint32_t old_asid = (uint32_t)(md_sr64(h, b + 0x20) >> 48);
++	md_sw(h, b, 0);
++	if ((error = md_check32(h, b, 0, 1, "SCTLR disable"))) { goto fail; }
++	if (md_tlb_sync(h, old_asid)) { error = ETIMEDOUT; goto fail; }
++	uint32_t cbar = (1u << 16) | (0xfu << 12) | (3u << 8);
++	/* Linux io-pgtable's noncoherent-walk case: outer-shareable, inner
++	 * and outer noncacheable table reads. Tables are explicitly cleaned
++	 * above and immutable while attached; firmware coherency is not assumed.
++	 * Endpoint PTEs remain Normal WB and use explicit cache ownership below. */
++	uint32_t tcr = (1u << 23) | (2u << 12) | 32;
++	uint32_t tcr2 = (7u << 15) | h->ips; /* 8-bit ASID; TCR2.AS stays zero */
++	uint64_t ttbr = h->tables_pa | ((uint64_t)h->asid << 48);
++	md_sw(h, h->gr1 + 0x800 + 4 * h->cb, 1); /* AArch64 */
++	md_sw(h, h->gr1 + 4 * h->cb, cbar);
++	md_sw(h, b + 0x10, tcr2);
++	md_sw(h, b + 0x30, tcr);
++	md_sw64(h, b + 0x20, ttbr);
++	md_sw64(h, b + 0x28, 0);
++	md_sw(h, b + 0x38, 0xff); /* MAIR0 Attr0: Normal WB */
++	md_sw(h, b + 0x3c, 0);
++	md_sw(h, b + 0x58, md_sr(h, b + 0x58) & MD_SMMU_FSR_FAULT);
++	if ((error = md_check32(h, h->gr1 + 0x800 + 4 * h->cb, 1, 1, "CBA2R VA64")) ||
++	    (error = md_check32(h, h->gr1 + 4 * h->cb, cbar, 3u << 16, "CBAR stage")) ||
++	    (error = md_check32(h, b + 0x10, tcr2, 0xf, "TCR2 PA size")) ||
++	    (error = md_check32(h, b + 0x30, tcr, (1u << 23) | (1u << 22) | (3u << 14) | (1u << 7) | 0x3f, "TCR format")) ||
++	    (error = md_check_ttbr(h, b + 0x20, ttbr)) ||
++	    (error = md_check32(h, b + 0x38, 0xff, 0xff, "MAIR Attr0"))) { goto fail; }
++	if (md_tlb_sync(h, h->asid)) { error = ETIMEDOUT; goto fail; }
++	/* Abort on faults rather than stall forever; poll FSR instead of using IRQ. */
++	uint32_t sctlr = (1u << 12) | (1u << 5) | (1u << 2) | (1u << 1) | 1;
++	md_sw(h, b, sctlr);
++	if ((error = md_check32(h, b, sctlr, 1, "SCTLR enable"))) { goto fail; }
++	/* Linux uses TRANS + PRIVCFG_DEFAULT when attaching a DMA domain. */
++	uint32_t s2cr = h->cb;
++	md_sw(h, 0xc00 + 4 * h->smr, s2cr);
++	if ((error = md_check32(h, 0xc00 + 4 * h->smr, s2cr, (3u << 16) | 0xff, "S2CR route"))) { goto fail; }
++	md_sw(h, 0x800 + 4 * h->smr, (1u << 31) | h->sid);
++	if ((error = md_check32(h, 0x800 + 4 * h->smr, (1u << 31) | h->sid, UINT32_MAX, "SMR match"))) { goto fail; }
++	h->mapped = true;
++	MD_LOG("METROID TOUCH DMA: stream SMR=%u CB=%u ASID=%u IOVA=%llx PA=%llx bytes=%x TTBR=%llx (NC table walks, explicit cache sync)\n",
++	    h->smr, h->cb, h->asid, (unsigned long long)MD_IOVA,
++	    (unsigned long long)h->pool_pa, MD_POOL_SIZE, (unsigned long long)h->tables_pa);
++	return 0;
++fail:
++	md_sw(h, b, 0);
++	h->failed = true;
++	return error;
++}
+--- a/bsd/dev/metroid_ufs_smmu.h
++++ b/bsd/dev/metroid_ufs_smmu.h
+@@ -145,7 +145,7 @@
+ }
+ 
+ static int
+-mu_map_dma(struct mu_host *h)
++mu_map_dma_locked(struct mu_host *h)
+ {
+ 	h->phase = "dma-map";
+ 	if (mu_r(h, 0x58) || mu_r(h, 0x78) || (mu_r(h, 0x60) & 1) || (mu_r(h, 0x80) & 1)) { return EBUSY; }
+@@ -214,3 +214,15 @@
+ 	mu_fail(h);
+ 	return error;
+ }
++
++/* Domain allocation can race asynchronous touch registration. */
++extern void metroid_smmu_lock(void);
++extern void metroid_smmu_unlock(void);
++static int
++mu_map_dma(struct mu_host *h)
++{
++    metroid_smmu_lock();
++    int error = mu_map_dma_locked(h);
++    metroid_smmu_unlock();
++    return error;
++}
