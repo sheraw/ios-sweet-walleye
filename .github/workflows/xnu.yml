@@ -248,6 +248,11 @@ jobs:
       # push access (i.e. the person running the port) can `git fetch kernels`.
       - name: Publish kernel to the kernels branch
         if: always()
+        # GITHUB_TOKEN is not exported to the shell by itself; without this env
+        # the push URL ends up as "https://x-access-token:@github.com/..." and
+        # is rejected. The previous attempts failed for exactly that reason.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
           mkdir -p /tmp/pub
@@ -261,4 +266,4 @@ jobs:
           git config user.email "xnu-build@users.noreply.github.com"
           git add -A
           git commit -q -m "kernel build ${GITHUB_RUN_NUMBER}: ${KERNEL_CONFIG} ${MACHINE_CONFIG}"
-          git push -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:refs/heads/kernels
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:refs/heads/kernels
