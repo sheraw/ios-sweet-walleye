@@ -50,6 +50,10 @@ jobs:
     # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
     runs-on: macos-14
     timeout-minutes: 120
+    # Needed by the "Publish kernel" step at the end, which pushes to the
+    # kernels branch with the workflow's own token.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -238,3 +242,23 @@ jobs:
           name: xnu-kernel
           path: out/
           if-no-files-found: warn
+
+      # Artifact downloads need an authenticated API call, which a plain SSH
+      # user cannot make. Committing the kernels to a branch means anyone with
+      # push access (i.e. the person running the port) can `git fetch kernels`.
+      - name: Publish kernel to the kernels branch
+        if: always()
+        run: |
+          set -e
+          mkdir -p /tmp/pub
+          find out -maxdepth 1 -type f -name 'kernel.*' -exec cp {} /tmp/pub/ \; 2>/dev/null || true
+          [ -n "$(ls -A /tmp/pub 2>/dev/null)" ] || { echo "no kernel to publish"; exit 0; }
+          cd /tmp/pub
+          shasum -a 256 kernel.* > SHA256SUMS || true
+          ls -la
+          git init -q .
+          git config user.name  "xnu-build"
+          git config user.email "xnu-build@users.noreply.github.com"
+          git add -A
+          git commit -q -m "kernel build ${GITHUB_RUN_NUMBER}: ${KERNEL_CONFIG} ${MACHINE_CONFIG}"
+          git push -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:refs/heads/kernels
