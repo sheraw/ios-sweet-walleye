@@ -560,7 +560,7 @@ new file mode 100644
 +		return ENOTSUP;
 +	}
 +
-+	if ((uint64_t)reg[0] != 0x01d84000ULL || reg[1] < 0x3000) {
++	if ((uint64_t)reg[0] != 0x01da4000ULL || reg[1] < 0x2500) {
 +		printf("METROID UFS: unexpected MMIO range 0x%llx length 0x%llx\n",
 +		    (unsigned long long)reg[0], (unsigned long long)reg[1]);
 +		return ENXIO;

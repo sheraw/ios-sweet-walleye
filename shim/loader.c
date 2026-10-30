@@ -142,6 +142,20 @@ const char *loader_boot(uintptr_t dtb)
 
 	/* Everything was written with the MMU and caches off; drop any stale I-cache lines too. */
 	__asm__ volatile("dsb sy; ic iallu; dsb sy; isb" ::: "memory");
+#ifdef SHIM_HALT_BEFORE_JUMP
+	/*
+	 * Bring-up aid. There is no serial port and no USB console until XNU is up,
+	 * so "did the bootloader accept the image and reach the loader?" cannot be
+	 * answered from the screen alone. Built this way the shim stops here
+	 * forever: the device disappears from fastboot and never comes back, which
+	 * is a signal the host can read with nobody watching the panel. A rejected
+	 * image returns to fastboot within a second or two instead.
+	 */
+	con_str("HALT", "SHIM_HALT_BEFORE_JUMP: payload parsed, not jumping");
+	for (;;)
+		__asm__ volatile("wfe");
+#else
 	((xnu_entry_t)entry_pa)(ba_pa);
 	return "xnu returned";
+#endif
 }

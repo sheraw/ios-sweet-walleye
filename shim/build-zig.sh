@@ -73,7 +73,16 @@ print('   gzip %d B + dtb %d B = %d B' % (len(blob), len(dtb), len(blob) + len(d
 PYEOF
 
 echo "== ramdisk =="
-$PY "$TOOLS/mkramdisk.py" out/ramdisk.bin
+# The shim reads the XNU payload straight off /chosen/linux,initrd-start
+# (shim/loader.c), so the ramdisk IS payload.bin - not a cpio archive. If the
+# payload is missing, fall back to the empty ramdisk the probe stages use.
+if [ -f "${RAMDISK:-../../../walleye-port/out/payload.bin}" ]; then
+	cp "${RAMDISK:-../../../walleye-port/out/payload.bin}" out/ramdisk.bin
+	echo "   ramdisk = xnu payload ($(stat -c %s out/ramdisk.bin) B)"
+else
+	$PY "$TOOLS/mkramdisk.py" out/ramdisk.bin
+	echo "   ramdisk = empty (no payload found)"
+fi
 
 echo "== boot.img =="
 $PY "$TOOLS/mkbootimg.py" --header_version 0 \
